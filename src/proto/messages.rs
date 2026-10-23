@@ -336,6 +336,23 @@ mod tests {
     }
 
     #[test]
+    fn display_requests_for_a_portrait_and_a_fullscreen_window_advertise_one_landscape_maximum() {
+        // macOS 27 keeps the first maximum of a session. A portrait maximum
+        // of 2880x5120 made it answer the later fullscreen request with
+        // 1920x1080 pixels.
+        let max = (5120, 2880);
+        let portrait = DisplayRequest::for_pixels(2880, 3184, 2.0, max);
+        let fullscreen = DisplayRequest::for_pixels(6016, 3384, 2.0, max);
+        assert_eq!((portrait.width, portrait.height), (1302, 1440));
+        assert_eq!(fullscreen.backing(), (5120, 2880));
+        for r in [portrait, fullscreen] {
+            let m = set_display_configuration(&r);
+            let di = &m[12..];
+            assert_eq!((be32(di, 0x8A), be32(di, 0x8E)), (5120, 2880));
+        }
+    }
+
+    #[test]
     fn display_request_shrinks_a_6k_window_into_a_5k_maximum() {
         let r = DisplayRequest::for_pixels(6016, 3304, 2.0, (5120, 2880));
         assert_eq!((r.width, r.height), (2560, 1406));

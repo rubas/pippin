@@ -269,6 +269,10 @@ impl Shared {
 pub struct Session {
     shared: Arc<Shared>,
     threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// The maximum of the first display request. macOS 27 keeps it for
+    /// the whole session, and answers a later request that exceeds it
+    /// with a smaller display of its own choice.
+    max_backing: (u32, u32),
 }
 
 impl Session {
@@ -297,7 +301,7 @@ impl Session {
             metrics: metrics::Metrics::default(),
         });
         let threads = Arc::new(Mutex::new(Vec::new()));
-        let session = Session { shared: shared.clone(), threads: threads.clone() };
+        let session = Session { shared: shared.clone(), threads: threads.clone(), max_backing: display.max_backing };
         let main = thread::Builder::new()
             .name("control".into())
             .spawn(move || {
@@ -341,6 +345,11 @@ impl Session {
         if let Some(c) = self.control() {
             c.send(&messages::encrypted_pointer_event(&c.record_key, buttons, x, y));
         }
+    }
+
+    /// The maximum that each display request of this session must carry.
+    pub fn max_backing(&self) -> (u32, u32) {
+        self.max_backing
     }
 
     /// Asks the host to resize its virtual display. Returns false before

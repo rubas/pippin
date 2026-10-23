@@ -103,15 +103,17 @@ struct App {
 }
 
 impl App {
-    fn display_request(&self) -> Option<DisplayRequest> {
+    /// The maximum to advertise for a new session: `--max-resolution`, or
+    /// else the largest monitor, cut to the GPU texture limit.
+    fn session_max(&self) -> Option<(u32, u32)> {
         let (w, renderer) = (self.window.as_ref()?, self.renderer.as_ref()?);
+        Some(max_backing(self.opts.max_resolution.or_else(|| monitor_pixels(w)), renderer.max_texture_side()))
+    }
+
+    fn display_request(&self, max: (u32, u32)) -> Option<DisplayRequest> {
+        let w = self.window.as_ref()?;
         let scale = self.opts.scale.unwrap_or(if w.scale_factor() >= 1.5 { 2.0 } else { 1.0 });
         let size = w.inner_size();
-        let max = max_backing(
-            self.opts.max_resolution.or_else(|| monitor_pixels(w)),
-            (size.width, size.height),
-            renderer.max_texture_side(),
-        );
         // Same logical size, fewer backing pixels: the Mac lays out as usual
         // and we scale up its smaller picture.
         let r = self.cfg.op.lock().render_scale;
@@ -120,7 +122,8 @@ impl App {
     }
 
     fn send_resize(&mut self) {
-        let (Some(req), Some(s)) = (self.display_request(), &self.session) else { return };
+        let Some(s) = &self.session else { return };
+        let Some(req) = self.display_request(s.max_backing()) else { return };
         if self.last_request != Some(req) && s.resize(req) {
             self.last_request = Some(req);
         }
@@ -226,7 +229,7 @@ impl App {
     }
 
     fn start_session(&mut self) {
-        let Some(req) = self.display_request() else { return };
+        let Some(req) = self.session_max().and_then(|max| self.display_request(max)) else { return };
         self.last_request = Some(req);
         // Process-wide, so events left queued by a previous viewer run on
         // the shared event loop can't match a new session.
@@ -276,27 +279,21 @@ impl App {
     }
 }
 
-/// Pixel size of the window's monitor. Before the compositor has placed
-/// the window (Wayland tells us only then), the largest monitor.
+/// Pixel size of the largest monitor, so that the window fits on each
+/// monitor that it can move to during the session.
 fn monitor_pixels(w: &Window) -> Option<(u32, u32)> {
-    let size = |m: winit::monitor::MonitorHandle| Some(m.size()).filter(|s| s.width > 0 && s.height > 0);
-    w.current_monitor()
-        .and_then(size)
-        .or_else(|| w.available_monitors().filter_map(size).max_by_key(|s| s.width as u64 * s.height as u64))
+    w.available_monitors()
+        .map(|m| m.size())
+        .filter(|s| s.width > 0 && s.height > 0)
+        .max_by_key(|s| s.width as u64 * s.height as u64)
         .map(|s| (s.width, s.height))
 }
 
 /// The largest backing size to ask the host for: `wanted` (the monitor or
-/// the command line), turned to the orientation of `window`, cut to what
-/// one GPU texture holds, as the decoded canvas becomes one texture per
-/// plane. Wayland gives a rotated monitor's size before the rotation.
-fn max_backing(wanted: Option<(u32, u32)>, window: (u32, u32), texture_side: u32) -> (u32, u32) {
-    let portrait = |(w, h): (u32, u32)| h > w;
-    let (w, h) = match wanted {
-        Some((w, h)) if portrait((w, h)) != portrait(window) => (h, w),
-        Some(size) => size,
-        None => (texture_side, texture_side),
-    };
+/// the command line), cut to what one GPU texture holds, as the decoded
+/// canvas becomes one texture per plane.
+fn max_backing(wanted: Option<(u32, u32)>, texture_side: u32) -> (u32, u32) {
+    let (w, h) = wanted.unwrap_or((texture_side, texture_side));
     (w.min(texture_side), h.min(texture_side))
 }
 
@@ -525,21 +522,16 @@ mod tests {
 
     #[test]
     fn max_backing_is_the_6k_monitor_within_a_16k_texture() {
-        assert_eq!(max_backing(Some((6016, 3384)), (6016, 3304), 16384), (6016, 3384));
+        assert_eq!(max_backing(Some((6016, 3384)), 16384), (6016, 3384));
     }
 
     #[test]
     fn max_backing_cuts_each_side_to_the_texture_limit() {
-        assert_eq!(max_backing(Some((10240, 4320)), (5120, 2160), 8192), (8192, 4320));
+        assert_eq!(max_backing(Some((10240, 4320)), 8192), (8192, 4320));
     }
 
     #[test]
     fn max_backing_without_a_monitor_is_the_texture_limit() {
-        assert_eq!(max_backing(None, (6016, 3304), 8192), (8192, 8192));
-    }
-
-    #[test]
-    fn max_backing_turns_a_landscape_monitor_for_a_portrait_window() {
-        assert_eq!(max_backing(Some((2560, 1440)), (1440, 2560), 16384), (1440, 2560));
+        assert_eq!(max_backing(None, 8192), (8192, 8192));
     }
 }
