@@ -85,7 +85,8 @@ fn record_layer_matches_reference() {
 
 #[test]
 fn messages_match_reference() {
-    let req = DisplayRequest { width: 1600, height: 900, scale: 2.0 };
+    // The reference always sends a 3840×2160 maximum.
+    let req = DisplayRequest { width: 1600, height: 900, scale: 2.0, max_backing: (3840, 2160) };
     assert_eq!(messages::set_display_configuration(&req), hex(VD));
     assert_eq!(messages::key_event(true, 0xffe3), hex(KEY));
     let k: [u8; 16] = std::array::from_fn(|i| 100 + i as u8);

@@ -347,11 +347,12 @@ impl Session {
     pub fn resize(&self, req: DisplayRequest) {
         if let Some(c) = self.control() {
             tracing::info!(
-                "requesting {}x{} @{}x (backing {:?})",
+                "requesting {}x{} @{}x (backing {:?}, max {:?})",
                 req.width,
                 req.height,
                 req.scale,
-                req.backing()
+                req.backing(),
+                req.max_backing
             );
             c.send(&messages::set_display_configuration(&req));
         }

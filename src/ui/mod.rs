@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
@@ -100,18 +100,20 @@ struct App {
 }
 
 impl App {
-    fn display_request(&self, size: PhysicalSize<u32>, scale_factor: f64) -> DisplayRequest {
-        let scale = self.opts.scale.unwrap_or(if scale_factor >= 1.5 { 2.0 } else { 1.0 });
+    fn display_request(&self) -> Option<DisplayRequest> {
+        let (w, renderer) = (self.window.as_ref()?, self.renderer.as_ref()?);
+        let scale = self.opts.scale.unwrap_or(if w.scale_factor() >= 1.5 { 2.0 } else { 1.0 });
+        let max = max_backing(monitor_pixels(w), renderer.max_texture_side());
         // Same logical size, fewer backing pixels: the Mac lays out as usual
         // and we scale up its smaller picture.
         let r = self.cfg.op.lock().render_scale;
+        let size = w.inner_size();
         let px = |v: u32| (v as f64 * r).round() as u32;
-        DisplayRequest::for_pixels(px(size.width), px(size.height), scale * r)
+        Some(DisplayRequest::for_pixels(px(size.width), px(size.height), scale * r, max))
     }
 
     fn send_resize(&mut self) {
-        let (Some(w), Some(s)) = (&self.window, &self.session) else { return };
-        let req = self.display_request(w.inner_size(), w.scale_factor());
+        let (Some(req), Some(s)) = (self.display_request(), &self.session) else { return };
         if self.last_request != Some(req) {
             self.last_request = Some(req);
             s.resize(req);
@@ -218,8 +220,7 @@ impl App {
     }
 
     fn start_session(&mut self) {
-        let Some(w) = &self.window else { return };
-        let req = self.display_request(w.inner_size(), w.scale_factor());
+        let Some(req) = self.display_request() else { return };
         self.last_request = Some(req);
         // Process-wide, so events left queued by a previous viewer run on
         // the shared event loop can't match a new session.
@@ -267,6 +268,24 @@ impl App {
         self.error = Some(msg);
         el.exit();
     }
+}
+
+/// Pixel size of the window's monitor. Before the compositor has placed
+/// the window (Wayland tells us only then), the largest monitor.
+fn monitor_pixels(w: &Window) -> Option<(u32, u32)> {
+    let size = |m: winit::monitor::MonitorHandle| Some(m.size()).filter(|s| s.width > 0 && s.height > 0);
+    w.current_monitor()
+        .and_then(size)
+        .or_else(|| w.available_monitors().filter_map(size).max_by_key(|s| s.width as u64 * s.height as u64))
+        .map(|s| (s.width, s.height))
+}
+
+/// The largest backing size to ask the host for: `wanted` (the monitor),
+/// cut to what one GPU texture holds, as the decoded
+/// canvas becomes one texture per plane.
+fn max_backing(wanted: Option<(u32, u32)>, texture_side: u32) -> (u32, u32) {
+    let (w, h) = wanted.unwrap_or((texture_side, texture_side));
+    (w.min(texture_side), h.min(texture_side))
 }
 
 /// Window attributes carrying the app id (Wayland) and WM_CLASS (X11), so
@@ -485,5 +504,25 @@ pub fn run(event_loop: &mut EventLoop<Tagged>, cfg: Config, opts: Options) -> Re
     match app.error {
         Some(e) => anyhow::bail!(e),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::max_backing;
+
+    #[test]
+    fn max_backing_is_the_6k_monitor_within_a_16k_texture() {
+        assert_eq!(max_backing(Some((6016, 3384)), 16384), (6016, 3384));
+    }
+
+    #[test]
+    fn max_backing_cuts_each_side_to_the_texture_limit() {
+        assert_eq!(max_backing(Some((10240, 4320)), 8192), (8192, 4320));
+    }
+
+    #[test]
+    fn max_backing_without_a_monitor_is_the_texture_limit() {
+        assert_eq!(max_backing(None, 8192), (8192, 8192));
     }
 }

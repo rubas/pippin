@@ -255,6 +255,11 @@ impl Renderer {
         self.dimmed = dimmed;
     }
 
+    /// Largest width or height of a texture on this GPU.
+    pub fn max_texture_side(&self) -> u32 {
+        self.device.limits().max_texture_dimension_2d
+    }
+
     /// Size of the drawn image in stream pixels (the pointer coordinate space).
     pub fn image_size(&self) -> Option<(u32, u32)> {
         self.planes.as_ref().map(|p| (p.width, p.height)).or(self.canvas)
