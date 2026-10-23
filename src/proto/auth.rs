@@ -130,11 +130,6 @@ fn rsa1_init<S: Read + Write>(sock: &mut S) -> Result<RsaPublicKey> {
     RsaPublicKey::from_public_key_der(der).context("parsing server RSA key")
 }
 
-fn rsa_encrypt(key: &RsaPublicKey, data: &[u8]) -> Result<Vec<u8>> {
-    key.encrypt(&mut OsRng, Pkcs1v15Encrypt, data)
-        .context("RSA encrypt")
-}
-
 fn aes_ecb_encrypt(key: &[u8], data: &mut [u8]) {
     let cipher = Aes128::new(GenericArray::from_slice(&key[..16]));
     for block in data.as_chunks_mut::<16>().0 {
@@ -244,7 +239,7 @@ struct Proof {
     key: [u8; 16],
 }
 
-fn solve_srp(ch: &Challenge, password: &str) -> Result<Proof> {
+fn solve_srp(ch: &Challenge, password: &str) -> Proof {
     let Group { n, g, h_ng, k } = &*GROUP;
 
     let mut a_raw = [0u8; 64];
@@ -254,9 +249,6 @@ fn solve_srp(ch: &Challenge, password: &str) -> Result<Proof> {
     let b_pub = pad(&ch.b);
 
     let u = BigUint::from_bytes_be(&sha512(&[&a_pub, &b_pub]));
-    if u.is_zero() {
-        bail!("SRP scrambling parameter u is 0");
-    }
     let x = private_key(&ch.salt, ch.iterations, password) % n;
 
     let kgx = (k * g.modpow(&x, n)) % n;
@@ -267,10 +259,8 @@ fn solve_srp(ch: &Challenge, password: &str) -> Result<Proof> {
     let h_empty = sha512(&[]);
     let m1 = sha512(&[h_ng, &h_empty, &ch.salt, &a_pub, &b_pub, &k_sess]);
     let m2 = sha512(&[&a_pub, &m1, &k_sess]);
-    let digest = Sha256::digest(k_sess);
-    let mut key = [0u8; 16];
-    key.copy_from_slice(&digest[..16]);
-    Ok(Proof { a_pub, m1, m2, key })
+    let key = Sha256::digest(k_sess)[..16].try_into().expect("SHA-256 has 32 bytes");
+    Proof { a_pub, m1, m2, key }
 }
 
 /// SRP-6a against screensharingd. Returns `SHA256(K)[..16]` once the host
@@ -285,7 +275,7 @@ pub fn srp_auth<S: Read + Write>(sock: &mut S, user: &str, password: &str) -> Re
     inner.extend_from_slice(&[0, 0, 0]);
     let mut plain = (inner.len() as u32).to_be_bytes().to_vec();
     plain.extend_from_slice(&inner);
-    let enc = rsa_encrypt(&server_key, &plain)?;
+    let enc = server_key.encrypt(&mut OsRng, Pkcs1v15Encrypt, &plain).context("RSA encrypt")?;
     if enc.len() != RSA_BLOCK_LEN {
         bail!("unexpected RSA block size {}", enc.len());
     }
@@ -302,7 +292,7 @@ pub fn srp_auth<S: Read + Write>(sock: &mut S, user: &str, password: &str) -> Re
     let ch = parse_challenge(&msg).with_context(|| format!("unusable SRP challenge ({} bytes)", msg.len()))?;
     tracing::debug!(iterations = ch.iterations, salt = ch.salt.len(), "SRP challenge");
 
-    let proof = solve_srp(&ch, password)?;
+    let proof = solve_srp(&ch, password);
 
     let mut civ = [0u8; 16];
     OsRng.fill_bytes(&mut civ);
