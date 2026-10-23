@@ -329,6 +329,11 @@ pub fn connect(p: &ConnectParams) -> Result<Negotiated> {
                 deadline = Instant::now() + ANSWER_TIMEOUT;
                 continue;
             }
+            // A canvas or a pending message passed the record MAC. Without
+            // one, nothing shows that the host holds the record keys.
+            if canvas.is_none() && pending.is_empty() {
+                bail!("the host sent no encrypted message that passed the integrity check");
+            }
             tracing::warn!("no usable media answer; continuing and waiting for video");
             canvas = None;
             break;
