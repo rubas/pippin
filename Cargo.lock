@@ -2772,6 +2772,7 @@ dependencies = [
  "sha1",
  "sha2",
  "socket2",
+ "subtle",
  "thiserror 2.0.21",
  "tracing",
  "tracing-subscriber",
