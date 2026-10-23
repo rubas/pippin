@@ -69,6 +69,11 @@ struct Cli {
     /// Defaults to 2 on HiDPI screens, else 1.
     #[arg(long)]
     scale: Option<f64>,
+    /// Largest virtual display to ask the Mac for, in pixels, e.g.
+    /// 5120x2880. Defaults to the size of the window's monitor. The Mac can
+    /// still choose a smaller one.
+    #[arg(long, value_parser = parse_size)]
+    max_resolution: Option<(u32, u32)>,
     /// Fraction of the window's pixels the Mac renders and streams; the
     /// picture is scaled up locally. 0.5 on a Retina screen streams a quarter
     /// of the pixels: less bandwidth and smaller keyframes for slow links, at
@@ -386,6 +391,7 @@ fn connect(
         host_name: host_name.to_owned(),
         size: cli.size,
         scale: cli.scale,
+        max_resolution: cli.max_resolution,
         auto_resize: !cli.no_auto_resize,
         swap_ctrl_cmd: cli.swap_ctrl_cmd,
         reconnect: !cli.no_reconnect,

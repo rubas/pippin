@@ -44,6 +44,9 @@ pub struct Options {
     pub size: (u32, u32),
     /// Backing scale to request; `None` follows the window's scale factor.
     pub scale: Option<f64>,
+    /// Largest virtual display to request, in pixels; `None` follows the
+    /// window's monitor.
+    pub max_resolution: Option<(u32, u32)>,
     pub auto_resize: bool,
     pub swap_ctrl_cmd: bool,
     /// Start a new session when an established one drops.
@@ -103,7 +106,7 @@ impl App {
     fn display_request(&self) -> Option<DisplayRequest> {
         let (w, renderer) = (self.window.as_ref()?, self.renderer.as_ref()?);
         let scale = self.opts.scale.unwrap_or(if w.scale_factor() >= 1.5 { 2.0 } else { 1.0 });
-        let max = max_backing(monitor_pixels(w), renderer.max_texture_side());
+        let max = max_backing(self.opts.max_resolution.or_else(|| monitor_pixels(w)), renderer.max_texture_side());
         // Same logical size, fewer backing pixels: the Mac lays out as usual
         // and we scale up its smaller picture.
         let r = self.cfg.op.lock().render_scale;
@@ -280,8 +283,8 @@ fn monitor_pixels(w: &Window) -> Option<(u32, u32)> {
         .map(|s| (s.width, s.height))
 }
 
-/// The largest backing size to ask the host for: `wanted` (the monitor),
-/// cut to what one GPU texture holds, as the decoded
+/// The largest backing size to ask the host for: `wanted` (the monitor or
+/// the command line), cut to what one GPU texture holds, as the decoded
 /// canvas becomes one texture per plane.
 fn max_backing(wanted: Option<(u32, u32)>, texture_side: u32) -> (u32, u32) {
     let (w, h) = wanted.unwrap_or((texture_side, texture_side));

@@ -84,6 +84,7 @@ When prompted interactively, `pippin` offers to save your password to the deskto
 | `--dialog` | Always show the GUI connect dialog, even when run from a terminal or with a saved password. |
 | `--session share\|alt` | Share the active user's screen (default), or log into a separate background session. |
 | `--scale N` | Set display scale. Defaults to `2` on HiDPI screens, `1` otherwise. |
+| `--max-resolution WxH` | Set the largest display, in pixels, that `pippin` asks the Mac for. Defaults to the size of your monitor. |
 | `--no-auto-resize` | Keep the Mac's display resolution fixed instead of resizing with the window. |
 | `--render-scale 0.5` | Stream at half resolution on a 2× display. Softens text slightly in exchange for a 75% bandwidth reduction. |
 | `--decoder <TYPE>` | Choose video decoder: `auto` (default), `cuda`, `vaapi`, or `software`. Use `--vaapi-device` to specify a render node. |
