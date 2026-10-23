@@ -158,7 +158,7 @@ impl Demux {
         if from.ip() != IpAddr::V4(self.host) {
             self.foreign += 1;
             if self.foreign.is_power_of_two() {
-                tracing::debug!("{} packets dropped that did not come from the host, the last from {from}", self.foreign);
+                tracing::debug!("dropped {} packets not from the host, the last from {from}", self.foreign);
             }
             return Datagram::Foreign;
         }
@@ -421,7 +421,7 @@ pub(super) fn video_rx(
                 Datagram::Rejected if n > 1 => {
                     bad += 1;
                     if bad.is_power_of_two() {
-                        tracing::debug!("{bad} undecryptable packets on the video port");
+                        tracing::debug!("{bad} packets on the video port refused: bad tag, replay, or malformed");
                     }
                 }
                 Datagram::Rejected | Datagram::Foreign => {}
@@ -1368,7 +1368,8 @@ mod tests {
         let host = SocketAddr::from((HOST, 5901));
         // Another machine on the LAN sends the host's own packets.
         let other = SocketAddr::from(([192, 168, 5, 240], 5901));
-        let got: Vec<_> = [(other, &video), (other, &sr), (host, &video), (host, &sr), (host, &video), (host, &sr)]
+        let sends = [(other, &video), (other, &sr), (host, &video), (host, &sr), (host, &video), (host, &sr)];
+        let got: Vec<_> = sends
             .into_iter()
             .map(|(from, p)| describe(demux.receive(from, p)).0)
             .collect();
