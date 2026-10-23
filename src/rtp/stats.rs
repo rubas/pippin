@@ -6,22 +6,17 @@
 //! needed: a long outage is plain loss and the extended sequence number
 //! never goes backwards.
 //!
-//! Unlike A.1, only unique packets count as received: duplicates and
-//! retransmissions of packets already seen are recognized within a window
-//! behind the highest index and ignored, and anything older than that (or
-//! older than the first packet) is ignored too. Received therefore never
-//! exceeds expected and cumulative loss is never negative. A retransmission
-//! that fills a hole does count, so loss the NACKs repaired is not reported.
+//! Unlike A.1, only unique packets count as received. The replay list of
+//! the SRTP receiver lets each index through once, and refuses one half the
+//! sequence space behind the newest, so no duplicate gets here; an index
+//! older than the first packet is ignored. Received therefore never exceeds
+//! expected and cumulative loss is never negative. A retransmission that
+//! fills a hole does count, so loss the NACKs repaired is not reported.
 
 use std::time::Duration;
 
-use super::window::SeenWindow;
-
 /// RTP clock of the video streams.
 pub const VIDEO_CLOCK_HZ: u64 = 90_000;
-
-/// Indexes remembered behind the highest one for duplicate detection.
-type Window = SeenWindow<16>;
 
 /// Largest cumulative loss a report block can carry (24-bit signed).
 const MAX_CUMULATIVE_LOST: i64 = 0x7f_ffff;
@@ -44,13 +39,13 @@ pub struct Report {
 
 /// Statistics for one SSRC.
 pub struct ReceiverStats {
+    /// Highest SRTP index seen.
+    max: u64,
     /// Index of the first packet.
     base: u64,
     received: u64,
     expected_prior: u64,
     received_prior: u64,
-    /// The highest SRTP index seen, and the packets just behind it.
-    seen: Window,
     /// RTP timestamp of the last frame used for jitter.
     jitter_ts: Option<u32>,
     /// Previous relative transit time, in RTP units.
@@ -63,11 +58,11 @@ impl ReceiverStats {
     /// Starts tracking at the first packet received.
     pub fn new(index: u64, ts: u32, arrival: Duration) -> Self {
         let mut s = Self {
+            max: index,
             base: index,
             received: 1,
             expected_prior: 0,
             received_prior: 0,
-            seen: Window::new(index),
             jitter_ts: None,
             transit: None,
             jitter16: 0,
@@ -77,16 +72,16 @@ impl ReceiverStats {
     }
 
     /// Records a packet's SRTP index, RTP timestamp and arrival time (from
-    /// any fixed origin).
+    /// any fixed origin). Each index comes once, after the SRTP replay list.
     pub fn record(&mut self, index: u64, ts: u32, arrival: Duration) {
-        let newest = index > self.seen.top();
-        if index < self.base || !self.seen.insert(index) {
+        if index < self.base {
             return;
         }
         self.received += 1;
         // A late packet is not used for jitter: a retransmission's transit
         // time says nothing about the path.
-        if newest {
+        if index > self.max {
+            self.max = index;
             self.update_jitter(ts, arrival);
         }
     }
@@ -110,7 +105,7 @@ impl ReceiverStats {
     }
 
     pub fn expected(&self) -> u64 {
-        self.seen.top() - self.base + 1
+        self.max - self.base + 1
     }
 
     pub fn received(&self) -> u64 {
@@ -118,7 +113,7 @@ impl ReceiverStats {
     }
 
     pub fn extended_seq(&self) -> u32 {
-        self.seen.top() as u32
+        self.max as u32
     }
 
     /// Interarrival jitter in RTP units.
@@ -203,15 +198,6 @@ mod tests {
     }
 
     #[test]
-    fn duplicates_ignored() {
-        let mut s = feed([0, 1, 1, 2, 4, 4, 2, 0]);
-        assert_eq!(s.received(), 4);
-        let r = s.report();
-        assert_eq!(r.cumulative_lost, 1);
-        assert_eq!(r.fraction_lost, 51); // 1/5
-    }
-
-    #[test]
     fn before_first_packet_ignored() {
         let mut s = feed([10, 11, 9, 12]);
         assert_eq!(s.report().cumulative_lost, 0);
@@ -230,55 +216,18 @@ mod tests {
         // A late packet from before the rollover is still recognized.
         s.record(65535, 0, Duration::ZERO);
         assert_eq!(s.report().cumulative_lost, 1);
-        // And a duplicate of one is not counted twice.
-        s.record(65535, 0, Duration::ZERO);
+    }
+
+    #[test]
+    fn a_retransmission_2000_behind_repairs_the_loss() {
+        // Index 1 comes back after 0 and 2 to 2000, as a late NACK repair
+        // behind a large keyframe.
+        let mut s = feed((0..=2000).filter(|&n| n != 1));
         assert_eq!(s.report().cumulative_lost, 1);
-    }
-
-    #[test]
-    fn window_slots_reused_after_gap() {
-        // Window slots wrap; marks left by earlier indexes must not make the
-        // skipped ones look received.
-        let mut s = feed([0, 1, 2]);
-        s.record(1500, 0, Duration::ZERO); // clears the whole window
-        s.record(1025, 0, Duration::ZERO); // slot of index 1
-        assert_eq!(s.received(), 5);
-        let mut s = feed([0, 1, 2, 1000]);
-        s.record(1030, 0, Duration::ZERO); // clears slots 1001..1029
-        s.record(1025, 0, Duration::ZERO);
-        s.record(1026, 0, Duration::ZERO);
-        assert_eq!(s.received(), 7);
-        assert_eq!(s.report().cumulative_lost, 1031 - 7);
-    }
-
-    #[test]
-    fn window_boundary() {
-        let mut s = feed([0, 2000]);
-        s.record(2000 - Window::SIZE + 1, 0, Duration::ZERO); // last slot in the window
-        s.record(2000 - Window::SIZE, 0, Duration::ZERO); // just outside: ignored
-        assert_eq!(s.received(), 3);
-        assert_eq!(s.extended_seq(), 2000);
-    }
-
-    #[test]
-    fn late_retransmissions_are_not_a_restart() {
-        // Review repro: two consecutive retransmissions far behind used to
-        // look like a sender restart.
-        let mut s = feed((0..3000).filter(|n| ![100, 101].contains(n)));
-        s.report();
-        for i in [100, 101, 3000] {
-            s.record(i, 0, Duration::ZERO);
-        }
+        s.record(1, 0, Duration::ZERO);
         let r = s.report();
-        assert_eq!(r.extended_seq, 3000);
-        assert_eq!((r.fraction_lost, r.cumulative_lost), (0, 2));
-        // Retransmissions inside the window do repair loss.
-        let mut s = feed((0..600).filter(|n| !(100..110).contains(n)));
-        for n in 100..110 {
-            s.record(n, 0, Duration::ZERO);
-        }
-        assert_eq!(s.report().cumulative_lost, 0);
-        assert_eq!(s.extended_seq(), 599);
+        assert_eq!((r.fraction_lost, r.cumulative_lost, r.extended_seq), (0, 0, 2000));
+        assert_eq!(s.received(), 2001);
     }
 
     #[test]
