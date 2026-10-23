@@ -161,7 +161,7 @@ impl Demux {
         if from.ip() != IpAddr::V4(self.host) {
             self.foreign += 1;
             if self.foreign.is_power_of_two() {
-                tracing::debug!("dropped {} packets not from the host, the last from {from}", self.foreign);
+                tracing::debug!(count = self.foreign, last = %from, "dropped packets not from the host");
             }
             return Datagram::Foreign;
         }
@@ -422,7 +422,7 @@ pub(super) fn video_rx(
                 Datagram::Rejected if n > 1 => {
                     bad += 1;
                     if bad.is_power_of_two() {
-                        tracing::debug!("{bad} packets on the video port refused: bad tag, replay, or malformed");
+                        tracing::debug!(count = bad, "refused packets on the video port: bad tag, replay, or malformed");
                     }
                 }
                 Datagram::Rejected | Datagram::Foreign => {}
