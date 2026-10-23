@@ -125,7 +125,9 @@ fn first_seen<const WORDS: usize>(seen: &mut HashMap<u32, SeenWindow<WORDS>>, ss
 /// SRTP receiver with per-SSRC rollover tracking and replay protection.
 pub struct SrtpReceiver {
     keys: SessionKeys,
-    /// The highest index of each SSRC holds its rollover count.
+    /// The highest index of each SSRC holds its rollover count. An SSRC
+    /// stays for the life of the key, also after the tiles stop using it,
+    /// so a replay of its packets is still refused.
     states: HashMap<u32, RtpWindow>,
     /// SRTP index (ROC << 16 | seq) of the last packet unprotected.
     last_index: u64,
@@ -147,10 +149,6 @@ impl SrtpReceiver {
     #[cfg(test)]
     pub fn extended_seq(&self, ssrc: u32) -> Option<u32> {
         self.states.get(&ssrc).map(|w| w.top() as u32)
-    }
-
-    pub fn forget(&mut self, keep: impl Fn(u32) -> bool) {
-        self.states.retain(|s, _| keep(*s));
     }
 
     pub fn unprotect(&mut self, pkt: &[u8]) -> Option<RtpPacket> {

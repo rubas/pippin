@@ -472,7 +472,6 @@ pub(super) fn video_rx(
             if let Some(backlog) = tiles.try_adopt(want, allow_switch) {
                 let ssrcs = tiles.ssrcs().to_vec();
                 asm.link(&ssrcs);
-                demux.srtp.forget(|s| ssrcs.contains(&s));
                 next_seq.clear();
                 nacked.clear();
                 watch = NackWatch::default();
