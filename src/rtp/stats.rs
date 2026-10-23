@@ -15,11 +15,13 @@
 
 use std::time::Duration;
 
+use super::window::SeenWindow;
+
 /// RTP clock of the video streams.
 pub const VIDEO_CLOCK_HZ: u64 = 90_000;
 
 /// Indexes remembered behind the highest one for duplicate detection.
-const WINDOW: u64 = 1024;
+type Window = SeenWindow<16>;
 
 /// Largest cumulative loss a report block can carry (24-bit signed).
 const MAX_CUMULATIVE_LOST: i64 = 0x7f_ffff;
@@ -42,15 +44,13 @@ pub struct Report {
 
 /// Statistics for one SSRC.
 pub struct ReceiverStats {
-    /// Highest SRTP index seen.
-    max: u64,
     /// Index of the first packet.
     base: u64,
     received: u64,
     expected_prior: u64,
     received_prior: u64,
-    /// Bit per index in the window behind `max`.
-    seen: [u64; WINDOW as usize / 64],
+    /// The highest SRTP index seen, and the packets just behind it.
+    seen: Window,
     /// RTP timestamp of the last frame used for jitter.
     jitter_ts: Option<u32>,
     /// Previous relative transit time, in RTP units.
@@ -63,56 +63,31 @@ impl ReceiverStats {
     /// Starts tracking at the first packet received.
     pub fn new(index: u64, ts: u32, arrival: Duration) -> Self {
         let mut s = Self {
-            max: index,
             base: index,
             received: 1,
             expected_prior: 0,
             received_prior: 0,
-            seen: [0; WINDOW as usize / 64],
+            seen: Window::new(index),
             jitter_ts: None,
             transit: None,
             jitter16: 0,
         };
-        s.mark(index);
         s.update_jitter(ts, arrival);
         s
-    }
-
-    fn bit(index: u64) -> (usize, u64) {
-        let i = (index % WINDOW) as usize;
-        (i / 64, 1 << (i % 64))
-    }
-
-    fn mark(&mut self, index: u64) {
-        let (w, b) = Self::bit(index);
-        self.seen[w] |= b;
     }
 
     /// Records a packet's SRTP index, RTP timestamp and arrival time (from
     /// any fixed origin).
     pub fn record(&mut self, index: u64, ts: u32, arrival: Duration) {
-        if index > self.max {
-            // Forget the window slots the new range reuses.
-            if index - self.max >= WINDOW {
-                self.seen = [0; WINDOW as usize / 64];
-            } else {
-                for i in self.max + 1..index {
-                    let (w, b) = Self::bit(i);
-                    self.seen[w] &= !b;
-                }
-            }
-            self.max = index;
-            self.mark(index);
-            self.received += 1;
+        let newest = index > self.seen.top();
+        if index < self.base || !self.seen.insert(index) {
+            return;
+        }
+        self.received += 1;
+        // A late packet is not used for jitter: a retransmission's transit
+        // time says nothing about the path.
+        if newest {
             self.update_jitter(ts, arrival);
-        } else if index >= self.base && self.max - index < WINDOW {
-            // Late or duplicate. Not used for jitter: a retransmission's
-            // transit time says nothing about the path.
-            let (w, b) = Self::bit(index);
-            if self.seen[w] & b == 0 {
-                self.seen[w] |= b;
-                self.received += 1;
-            }
         }
     }
 
@@ -135,7 +110,7 @@ impl ReceiverStats {
     }
 
     pub fn expected(&self) -> u64 {
-        self.max - self.base + 1
+        self.seen.top() - self.base + 1
     }
 
     pub fn received(&self) -> u64 {
@@ -143,7 +118,7 @@ impl ReceiverStats {
     }
 
     pub fn extended_seq(&self) -> u32 {
-        self.max as u32
+        self.seen.top() as u32
     }
 
     /// Interarrival jitter in RTP units.
@@ -279,8 +254,8 @@ mod tests {
     #[test]
     fn window_boundary() {
         let mut s = feed([0, 2000]);
-        s.record(2000 - WINDOW + 1, 0, Duration::ZERO); // last slot in the window
-        s.record(2000 - WINDOW, 0, Duration::ZERO); // just outside: ignored
+        s.record(2000 - Window::SIZE + 1, 0, Duration::ZERO); // last slot in the window
+        s.record(2000 - Window::SIZE, 0, Duration::ZERO); // just outside: ignored
         assert_eq!(s.received(), 3);
         assert_eq!(s.extended_seq(), 2000);
     }
