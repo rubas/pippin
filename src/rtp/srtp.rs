@@ -110,6 +110,18 @@ type RtpWindow = SeenWindow<{ 0x8000 / 64 }>;
 /// comes a few packets a second.
 type RtcpWindow = SeenWindow<1>;
 
+/// Marks `index` seen for `ssrc`. False for a replay, or an index too old
+/// to tell.
+fn first_seen<const WORDS: usize>(seen: &mut HashMap<u32, SeenWindow<WORDS>>, ssrc: u32, index: u64) -> bool {
+    match seen.entry(ssrc) {
+        Entry::Occupied(mut e) => e.get_mut().insert(index),
+        Entry::Vacant(e) => {
+            e.insert(SeenWindow::new(index));
+            true
+        }
+    }
+}
+
 /// SRTP receiver with per-SSRC rollover tracking and replay protection.
 pub struct SrtpReceiver {
     keys: SessionKeys,
@@ -182,14 +194,7 @@ impl SrtpReceiver {
             return None;
         }
         let index = ((roc as u64) << 16) | seq as u64;
-        let fresh = match self.states.entry(ssrc) {
-            Entry::Occupied(mut e) => e.get_mut().insert(index),
-            Entry::Vacant(e) => {
-                e.insert(RtpWindow::new(index));
-                true
-            }
-        };
-        if !fresh {
+        if !first_seen(&mut self.states, ssrc, index) {
             return None;
         }
         let mut payload = body[hdr..].to_vec();
@@ -295,14 +300,7 @@ impl SrtcpReceiver {
         let e_index = u32::from_be_bytes(body[body.len() - 4..].try_into().unwrap());
         let index = e_index & 0x7fff_ffff;
         let ssrc = u32::from_be_bytes(body[4..8].try_into().unwrap());
-        let fresh = match self.seen.entry(ssrc) {
-            Entry::Occupied(mut e) => e.get_mut().insert(index as u64),
-            Entry::Vacant(e) => {
-                e.insert(RtcpWindow::new(index as u64));
-                true
-            }
-        };
-        if !fresh {
+        if !first_seen(&mut self.seen, ssrc, index as u64) {
             return None;
         }
         let mut out = body[..body.len() - 4].to_vec();
