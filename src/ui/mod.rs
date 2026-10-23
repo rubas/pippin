@@ -106,11 +106,15 @@ impl App {
     fn display_request(&self) -> Option<DisplayRequest> {
         let (w, renderer) = (self.window.as_ref()?, self.renderer.as_ref()?);
         let scale = self.opts.scale.unwrap_or(if w.scale_factor() >= 1.5 { 2.0 } else { 1.0 });
-        let max = max_backing(self.opts.max_resolution.or_else(|| monitor_pixels(w)), renderer.max_texture_side());
+        let size = w.inner_size();
+        let max = max_backing(
+            self.opts.max_resolution.or_else(|| monitor_pixels(w)),
+            (size.width, size.height),
+            renderer.max_texture_side(),
+        );
         // Same logical size, fewer backing pixels: the Mac lays out as usual
         // and we scale up its smaller picture.
         let r = self.cfg.op.lock().render_scale;
-        let size = w.inner_size();
         let px = |v: u32| (v as f64 * r).round() as u32;
         Some(DisplayRequest::for_pixels(px(size.width), px(size.height), scale * r, max))
     }
@@ -284,10 +288,16 @@ fn monitor_pixels(w: &Window) -> Option<(u32, u32)> {
 }
 
 /// The largest backing size to ask the host for: `wanted` (the monitor or
-/// the command line), cut to what one GPU texture holds, as the decoded
-/// canvas becomes one texture per plane.
-fn max_backing(wanted: Option<(u32, u32)>, texture_side: u32) -> (u32, u32) {
-    let (w, h) = wanted.unwrap_or((texture_side, texture_side));
+/// the command line), turned to the orientation of `window`, cut to what
+/// one GPU texture holds, as the decoded canvas becomes one texture per
+/// plane. Wayland gives a rotated monitor's size before the rotation.
+fn max_backing(wanted: Option<(u32, u32)>, window: (u32, u32), texture_side: u32) -> (u32, u32) {
+    let portrait = |(w, h): (u32, u32)| h > w;
+    let (w, h) = match wanted {
+        Some((w, h)) if portrait((w, h)) != portrait(window) => (h, w),
+        Some(size) => size,
+        None => (texture_side, texture_side),
+    };
     (w.min(texture_side), h.min(texture_side))
 }
 
@@ -516,16 +526,21 @@ mod tests {
 
     #[test]
     fn max_backing_is_the_6k_monitor_within_a_16k_texture() {
-        assert_eq!(max_backing(Some((6016, 3384)), 16384), (6016, 3384));
+        assert_eq!(max_backing(Some((6016, 3384)), (6016, 3304), 16384), (6016, 3384));
     }
 
     #[test]
     fn max_backing_cuts_each_side_to_the_texture_limit() {
-        assert_eq!(max_backing(Some((10240, 4320)), 8192), (8192, 4320));
+        assert_eq!(max_backing(Some((10240, 4320)), (5120, 2160), 8192), (8192, 4320));
     }
 
     #[test]
     fn max_backing_without_a_monitor_is_the_texture_limit() {
-        assert_eq!(max_backing(None, 8192), (8192, 8192));
+        assert_eq!(max_backing(None, (6016, 3304), 8192), (8192, 8192));
+    }
+
+    #[test]
+    fn max_backing_turns_a_landscape_monitor_for_a_portrait_window() {
+        assert_eq!(max_backing(Some((2560, 1440)), (1440, 2560), 16384), (1440, 2560));
     }
 }

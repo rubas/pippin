@@ -70,8 +70,8 @@ struct Cli {
     #[arg(long)]
     scale: Option<f64>,
     /// Largest virtual display to ask the Mac for, in pixels, e.g.
-    /// 5120x2880. Defaults to the size of the window's monitor. The Mac can
-    /// still choose a smaller one.
+    /// 5120x2880, in either orientation. Defaults to the size of the
+    /// window's monitor. The Mac can still choose a smaller one.
     #[arg(long, value_parser = parse_size)]
     max_resolution: Option<(u32, u32)>,
     /// Fraction of the window's pixels the Mac renders and streams; the
