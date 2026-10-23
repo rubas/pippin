@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-use super::auth::{self, AuthError};
+use super::auth;
 use crate::errors::Failure;
 use super::messages::{self, DisplayRequest, ENC_RECORD_KEYS};
 use super::offers::{CanvasInfo, MediaOffer, OfferOptions, parse_answer};
@@ -112,23 +112,13 @@ fn open(p: &ConnectParams) -> Result<TcpStream> {
     Ok(s)
 }
 
-/// Opens a connection and authenticates, preferring SRP and falling back to
-/// the RSA1/AES path on a fresh connection when the host lacks SRP.
+/// Opens a connection and logs in with SRP. There is no other login: the
+/// legacy RSA1 path sends the password under an RSA key that nothing
+/// authenticates, so a spoofed host could read it.
 fn authenticate(p: &ConnectParams) -> Result<(TcpStream, [u8; 16])> {
     let mut s = open(p)?;
-    match auth::srp_auth(&mut s, &p.user, &p.password) {
-        Ok(key) => {
-            tracing::info!("authenticated (SRP)");
-            return Ok((s, key));
-        }
-        Err(e) if matches!(e.downcast_ref::<AuthError>(), Some(AuthError::SrpUnavailable(_))) => {
-            tracing::info!("{e}; retrying with legacy auth");
-        }
-        Err(e) => return Err(e.context("SRP authentication failed")),
-    }
-    let mut s = open(p)?;
-    let key = auth::nonsrp_auth(&mut s, &p.user, &p.password).context("legacy authentication failed")?;
-    tracing::info!("authenticated (legacy RSA1)");
+    let key = auth::srp_auth(&mut s, &p.user, &p.password).context("SRP authentication failed")?;
+    tracing::info!("authenticated (SRP)");
     Ok((s, key))
 }
 

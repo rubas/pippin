@@ -1,9 +1,8 @@
-//! RFB security type 33 (0x21): Apple's SRP-4096-SHA512-PBKDF2 exchange and
-//! the legacy RSA1 + AES-ECB credential path.
+//! RFB security type 33 (0x21): Apple's SRP-4096-SHA512-PBKDF2 exchange.
 //!
-//! Both paths begin with the same "RSA1 init" request that fetches the
-//! server's RSA-2048 public key, and both yield a 16-byte AES key that later
-//! unwraps the enc1103 record-layer keys.
+//! It begins with an "RSA1 init" request that fetches the server's RSA-2048
+//! public key, and yields a 16-byte AES key that later unwraps the enc1103
+//! record-layer keys.
 
 use std::io::{Read, Write};
 
@@ -25,14 +24,10 @@ const SRP_HASH_LEN: u8 = 64;
 const SRP_DK_LEN: usize = 128;
 const SRP_MAX_ITERATIONS: u64 = 1_000_000;
 const RSA_BLOCK_LEN: usize = 256;
-const CRED_SLOT_LEN: usize = 64;
 
-/// The server rejected the credentials or answered in a shape that tells us
-/// to try the other auth path.
+/// The server rejected the credentials.
 #[derive(Debug, Error)]
 pub enum AuthError {
-    #[error("server did not take the SRP path ({0}-byte challenge)")]
-    SrpUnavailable(usize),
     #[error("authentication rejected by server (result {0})")]
     Rejected(u32),
 }
@@ -59,43 +54,6 @@ fn aes_ecb_encrypt(key: &[u8], data: &mut [u8]) {
     for block in data.as_chunks_mut::<16>().0 {
         cipher.encrypt_block(GenericArray::from_mut_slice(block));
     }
-}
-
-/// Legacy path: AES-ECB-encrypted credential slots plus the RSA-wrapped AES
-/// key. Returns the AES key.
-pub fn nonsrp_auth<S: Read + Write>(sock: &mut S, user: &str, password: &str) -> Result<[u8; 16]> {
-    let server_key = rsa1_init(sock)?;
-    let mut aes_key = [0u8; 16];
-    OsRng.fill_bytes(&mut aes_key);
-
-    let mut creds = Vec::with_capacity(2 * CRED_SLOT_LEN);
-    for value in [user, password] {
-        let mut slot = [0u8; CRED_SLOT_LEN];
-        OsRng.fill_bytes(&mut slot);
-        let bytes = value.as_bytes();
-        let n = bytes.len().min(CRED_SLOT_LEN - 1);
-        slot[..n].copy_from_slice(&bytes[..n]);
-        slot[n] = 0;
-        creds.extend_from_slice(&slot);
-    }
-    aes_ecb_encrypt(&aes_key, &mut creds);
-    let enc_key = rsa_encrypt(&server_key, &aes_key)?;
-
-    let mut blob = Vec::new();
-    blob.extend_from_slice(b"\x01\x00RSA1\x00\x01");
-    blob.extend_from_slice(&creds);
-    blob.extend_from_slice(b"\x00\x01");
-    blob.extend_from_slice(&enc_key);
-    let mut msg = (blob.len() as u32).to_be_bytes().to_vec();
-    msg.extend_from_slice(&blob);
-    sock.write_all(&msg)?;
-
-    read_vec(sock, 4)?; // padding
-    let result = read_u32(sock)?;
-    if result != 0 {
-        return Err(AuthError::Rejected(result).into());
-    }
-    Ok(aes_key)
 }
 
 struct Challenge {
@@ -204,10 +162,7 @@ pub fn srp_auth<S: Read + Write>(sock: &mut S, user: &str, password: &str) -> Re
 
     let len = read_u32(sock)? as usize;
     let body = read_vec(sock, len)?;
-    if len < 1000 {
-        return Err(AuthError::SrpUnavailable(len).into());
-    }
-    let ch = parse_challenge(&body).context("malformed SRP challenge")?;
+    let ch = parse_challenge(&body).with_context(|| format!("malformed SRP challenge ({len} bytes)"))?;
     if ch.iterations > SRP_MAX_ITERATIONS {
         bail!("SRP iteration count {} exceeds cap", ch.iterations);
     }
