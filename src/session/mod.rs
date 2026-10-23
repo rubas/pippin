@@ -595,9 +595,8 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
     }
     {
         let (shared, sock) = (shared.clone(), ctrl_sock.try_clone()?);
-        let key = neg.offer.video_key_s;
-        let audio = cfg.audio.clone().map(|p| (p, neg.offer.audio_key_s));
-        spawn(threads, "ctrl-rx", move || media::ctrl_rx(shared, sock, key, audio));
+        let (key, audio_key, player) = (neg.offer.video_key_s, neg.offer.audio_key_s, cfg.audio.clone());
+        spawn(threads, "ctrl-rx", move || media::ctrl_rx(shared, sock, key, audio_key, player));
     }
     {
         let shared = shared.clone();

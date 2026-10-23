@@ -14,7 +14,7 @@ use super::{AfterLoss, Event, Shared};
 use crate::audio::Player;
 use crate::proto::offers::{MediaOffer, SRTP_BLOB_LEN};
 use crate::rtp::assembler::{AccessUnit, Assembler, HoldStats, POLL_EVERY, TileMap};
-use crate::rtp::srtp::{SrtcpReceiver, SrtcpSender, SrtpReceiver, SrtpSender};
+use crate::rtp::srtp::{RtpPacket, SrtcpReceiver, SrtcpSender, SrtpReceiver, SrtpSender};
 use crate::rtp::stats::{ReceiverStats, VIDEO_CLOCK_HZ};
 use crate::rtp::{hevc, rtcp};
 use crate::video::decoder::{self, Decoder, DecoderOptions, Picture};
@@ -121,8 +121,42 @@ fn is_timeout(e: &std::io::Error) -> bool {
     matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted)
 }
 
+/// RTP and RTCP share each media port. RFC 5761 4 tells them apart by the
+/// whole second byte: RTCP packet types are 192 to 223. An RTP packet has
+/// the marker bit and the payload type there, so only payload types 64 to
+/// 95 would collide, and the host uses none of them.
 fn is_rtcp(pkt: &[u8]) -> bool {
-    pkt.len() >= 8 && (200..=207).contains(&(pkt[1] & 0x7f))
+    pkt.len() >= 8 && (192..=223).contains(&pkt[1])
+}
+
+/// What a datagram on a media port turned out to be.
+enum Datagram {
+    Rtp(RtpPacket),
+    /// The plain compound RTCP packet.
+    Rtcp(Vec<u8>),
+    /// Failed authentication, or malformed.
+    Rejected,
+}
+
+/// Unprotects the SRTP and the SRTCP packets of one media port.
+struct Demux {
+    srtp: SrtpReceiver,
+    srtcp: SrtcpReceiver,
+}
+
+impl Demux {
+    fn new(rtp_key: &[u8; SRTP_BLOB_LEN], rtcp_key: &[u8; SRTP_BLOB_LEN]) -> Self {
+        Self { srtp: SrtpReceiver::new(rtp_key), srtcp: SrtcpReceiver::new(rtcp_key) }
+    }
+
+    fn receive(&mut self, pkt: &[u8]) -> Datagram {
+        let got = if is_rtcp(pkt) {
+            self.srtcp.unprotect(pkt).map(Datagram::Rtcp)
+        } else {
+            self.srtp.unprotect(pkt).map(Datagram::Rtp)
+        };
+        got.unwrap_or(Datagram::Rejected)
+    }
 }
 
 /// Keeps the host's sender reports (for our receiver reports) and folds any
@@ -288,8 +322,7 @@ pub(super) fn video_rx(
     dec: Sender<DecoderMsg>,
     fb: Sender<Feedback>,
 ) {
-    let mut srtp = SrtpReceiver::new(&key);
-    let srtcp = SrtcpReceiver::new(&key);
+    let mut demux = Demux::new(&key, &key);
     let mut asm = Assembler::default();
     let mut tiles = TileMap::default();
     let mut next_seq: HashMap<u32, u16> = HashMap::new();
@@ -310,13 +343,9 @@ pub(super) fn video_rx(
 
     while !shared.stopped() {
         match sock.recv_from(&mut buf) {
-            Ok((n, _)) => {
-                let pkt = &buf[..n];
-                if is_rtcp(pkt) {
-                    if let Some(data) = srtcp.unprotect(pkt) {
-                        record_sender_reports(&shared, &data);
-                    }
-                } else if let Some(p) = srtp.unprotect(pkt) {
+            Ok((n, _)) => match demux.receive(&buf[..n]) {
+                Datagram::Rtcp(data) => record_sender_reports(&shared, &data),
+                Datagram::Rtp(p) => {
                     let now = Instant::now();
                     shared.touch(&shared.last_video_packet);
                     shared.metrics.video_packets.fetch_add(1, Ordering::Relaxed);
@@ -362,7 +391,7 @@ pub(super) fn video_rx(
                             }
                             next_seq.insert(p.ssrc, p.seq.wrapping_add(1));
                         }
-                        let (index, at) = (srtp.last_index(), shared.clock.0.elapsed());
+                        let (index, at) = (demux.srtp.last_index(), shared.clock.0.elapsed());
                         match shared.rx_stats.lock().entry(p.ssrc) {
                             Entry::Occupied(mut e) => e.get_mut().record(index, p.ts, at),
                             Entry::Vacant(e) => {
@@ -374,13 +403,16 @@ pub(super) fn video_rx(
                     if !route(&mut tiles, &dec, aus) {
                         return;
                     }
-                } else if n > 1 {
+                }
+                // The 1-byte packets only keep a firewall path open.
+                Datagram::Rejected if n > 1 => {
                     bad += 1;
                     if bad.is_power_of_two() {
-                        tracing::debug!("{bad} undecryptable video packets");
+                        tracing::debug!("{bad} undecryptable packets on the video port");
                     }
                 }
-            }
+                Datagram::Rejected => {}
+            },
             Err(e) if is_timeout(&e) => {}
             Err(e) => {
                 tracing::debug!("video socket: {e}");
@@ -427,7 +459,7 @@ pub(super) fn video_rx(
             if let Some(backlog) = tiles.try_adopt(want, allow_switch) {
                 let ssrcs = tiles.ssrcs().to_vec();
                 asm.link(&ssrcs);
-                srtp.forget(|s| ssrcs.contains(&s));
+                demux.srtp.forget(|s| ssrcs.contains(&s));
                 next_seq.clear();
                 nacked.clear();
                 watch = NackWatch::default();
@@ -454,10 +486,11 @@ pub(super) fn ctrl_rx(
     shared: Arc<Shared>,
     sock: UdpSocket,
     key: [u8; SRTP_BLOB_LEN],
-    audio: Option<(Player, [u8; SRTP_BLOB_LEN])>,
+    audio_key: [u8; SRTP_BLOB_LEN],
+    player: Option<Player>,
 ) {
-    let srtcp = SrtcpReceiver::new(&key);
-    let mut audio = audio.and_then(|(player, key)| match AudioRx::new(player, &key) {
+    let mut demux = Demux::new(&audio_key, &key);
+    let mut audio = player.and_then(|player| match AudioRx::new(player) {
         Ok(rx) => Some(rx),
         Err(e) => {
             tracing::warn!("no sound: {e:#}");
@@ -467,16 +500,15 @@ pub(super) fn ctrl_rx(
     let mut buf = vec![0u8; 65536];
     while !shared.stopped() {
         match sock.recv_from(&mut buf) {
-            Ok((n, _)) => {
-                let pkt = &buf[..n];
-                if is_rtcp(pkt) {
-                    if let Some(data) = srtcp.unprotect(pkt) {
-                        record_sender_reports(&shared, &data);
+            Ok((n, _)) => match demux.receive(&buf[..n]) {
+                Datagram::Rtcp(data) => record_sender_reports(&shared, &data),
+                Datagram::Rtp(rtp) => {
+                    if let Some(a) = audio.as_mut() {
+                        a.packet(rtp);
                     }
-                } else if let Some(a) = audio.as_mut() {
-                    a.packet(pkt);
                 }
-            }
+                Datagram::Rejected => {}
+            },
             Err(e) if is_timeout(&e) => {}
             Err(e) => {
                 tracing::debug!("ctrl socket: {e}");
@@ -495,7 +527,6 @@ const MAX_CONCEAL: u16 = 3;
 
 /// Decrypts and decodes the host's audio stream.
 struct AudioRx {
-    srtp: SrtpReceiver,
     decoder: crate::audio::aac::Decoder,
     player: Player,
     last_seq: Option<u16>,
@@ -503,13 +534,12 @@ struct AudioRx {
 }
 
 impl AudioRx {
-    fn new(player: Player, key: &[u8; SRTP_BLOB_LEN]) -> anyhow::Result<Self> {
+    fn new(player: Player) -> anyhow::Result<Self> {
         let decoder = crate::audio::aac::Decoder::new()?;
-        Ok(Self { srtp: SrtpReceiver::new(key), decoder, player, last_seq: None, failures: 0 })
+        Ok(Self { decoder, player, last_seq: None, failures: 0 })
     }
 
-    fn packet(&mut self, pkt: &[u8]) {
-        let Some(rtp) = self.srtp.unprotect(pkt) else { return };
+    fn packet(&mut self, rtp: RtpPacket) {
         if rtp.pt != AUDIO_PT {
             return;
         }
@@ -1250,7 +1280,67 @@ pub(super) fn feedback(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rtp::srtp::RtpPacket;
+
+    const KEY: [u8; SRTP_BLOB_LEN] = [0x5a; SRTP_BLOB_LEN];
+    /// A sender report from SSRC 0x0a0b0c0d with no report blocks.
+    const SR: [u8; 28] = [
+        0x80, 200, 0, 6, 0x0a, 0x0b, 0x0c, 0x0d, 0xea, 0x1c, 0x2d, 0x3e, 0x40, 0, 0, 0, 0, 1, 0x5f, 0x90, 0, 0, 0, 9, 0,
+        0, 0x30, 0x39,
+    ];
+    /// An empty receiver report from the same SSRC.
+    const RR: [u8; 8] = [0x80, 201, 0, 1, 0x0a, 0x0b, 0x0c, 0x0d];
+
+    fn describe(d: Datagram) -> (&'static str, Vec<u8>) {
+        match d {
+            Datagram::Rtp(p) => ("rtp", p.payload),
+            Datagram::Rtcp(data) => ("rtcp", data),
+            Datagram::Rejected => ("rejected", Vec::new()),
+        }
+    }
+
+    #[test]
+    fn rtcp_is_told_from_rtp_by_the_whole_second_byte() {
+        let pkt = |b1: u8| [0x80, b1, 0, 1, 1, 2, 3, 4];
+        // SR, RR, the legacy FIR and the last RTCP type.
+        for b1 in [200, 201, 192, 223] {
+            assert!(is_rtcp(&pkt(b1)), "{b1}");
+        }
+        // RTP payload type 100 without and with the marker bit (0xe4),
+        // and the first value after the RTCP range.
+        for b1 in [100, 0xe4, 224] {
+            assert!(!is_rtcp(&pkt(b1)), "{b1}");
+        }
+        // Too short to be RTCP.
+        assert!(!is_rtcp(&[0x80, 200, 0, 0]));
+    }
+
+    #[test]
+    fn demux_sends_srtcp_to_rtcp_and_srtp_to_rtp() {
+        let mut rtp = SrtpSender::new(&KEY, 0x1111_2222);
+        let mut rtcp = SrtcpSender::new(&KEY);
+        let mut foreign = SrtcpSender::new(&[0x77; SRTP_BLOB_LEN]);
+        let mut demux = Demux::new(&KEY, &KEY);
+        let got: Vec<_> = [
+            rtp.protect(100, &[1, 2, 3]),
+            rtcp.protect(&SR),
+            rtp.protect(100, &[4, 5]),
+            rtcp.protect(&RR),
+            foreign.protect(&RR),
+        ]
+        .iter()
+        .map(|p| describe(demux.receive(p)))
+        .collect();
+        assert_eq!(
+            got,
+            [
+                ("rtp", vec![1, 2, 3]),
+                ("rtcp", SR.to_vec()),
+                ("rtp", vec![4, 5]),
+                ("rtcp", RR.to_vec()),
+                ("rejected", vec![]),
+            ]
+        );
+    }
 
     #[test]
     fn nack_watch_outlives_holds() {
