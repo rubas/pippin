@@ -177,9 +177,10 @@ pub fn confirm_save(input: &mut dyn BufRead) -> bool {
     input.read_line(&mut line).is_ok() && matches!(line.trim(), "y" | "Y" | "yes" | "Yes")
 }
 
-/// Saves a working password if wanted, and drops a stored one the host
-/// rejected so the next run prompts instead of failing again. `confirm` is
-/// only asked when `save` wasn't given.
+/// Saves a working password if wanted. `confirm` is only asked when `save`
+/// wasn't given. A rejected stored password stays: anyone who answers on the
+/// host's address can send a rejection, so only the user replaces or removes
+/// a saved password.
 pub fn after_auth(
     store: &dyn Store,
     account: &str,
@@ -195,9 +196,13 @@ pub fn after_auth(
                 tracing::info!("saved password for {account} to keyring");
             })
         }
-        (false, Source::Keyring) => store.delete(account).map(|_| {
-            tracing::warn!("stored password for {account} was rejected; removed it from keyring");
-        }),
+        (false, Source::Keyring) => {
+            tracing::warn!(
+                "the host rejected the saved password for {account}; type the new one with --dialog \
+                 and save it, or remove it with --forget-password"
+            );
+            Ok(())
+        }
         _ => Ok(()),
     };
     if let Err(e) = result {
@@ -372,11 +377,11 @@ mod tests {
     }
 
     #[test]
-    fn rejected_keyring_password_is_removed() {
+    fn rejected_keyring_password_is_kept() {
         let m = stored("old");
         after_auth(&m, ACC, "old", Source::Keyring, true, true, no_confirm);
-        assert!(m.get(ACC).unwrap().is_some());
+        assert_eq!(m.get(ACC).unwrap().as_deref(), Some("old"));
         after_auth(&m, ACC, "old", Source::Keyring, false, true, no_confirm);
-        assert!(m.get(ACC).unwrap().is_none());
+        assert_eq!(m.get(ACC).unwrap().as_deref(), Some("old"));
     }
 }
