@@ -15,7 +15,7 @@ impl<const WORDS: usize> SeenWindow<WORDS> {
     /// Starts at the first index seen.
     pub fn new(first: u64) -> Self {
         let mut w = Self { top: first, seen: [0; WORDS] };
-        w.set(first);
+        w.insert(first);
         w
     }
 
@@ -29,11 +29,6 @@ impl<const WORDS: usize> SeenWindow<WORDS> {
         ((i / 64) as usize, 1 << (i % 64))
     }
 
-    fn set(&mut self, index: u64) {
-        let (w, b) = Self::bit(index);
-        self.seen[w] |= b;
-    }
-
     /// Marks `index` seen. False if it was seen before, or is `SIZE` or more
     /// behind the top, where the window cannot tell.
     pub fn insert(&mut self, index: u64) -> bool {
@@ -42,16 +37,13 @@ impl<const WORDS: usize> SeenWindow<WORDS> {
             if index - self.top >= Self::SIZE {
                 self.seen = [0; WORDS];
             } else {
-                for i in self.top + 1..index {
+                for i in self.top + 1..=index {
                     let (w, b) = Self::bit(i);
                     self.seen[w] &= !b;
                 }
             }
             self.top = index;
-            self.set(index);
-            return true;
-        }
-        if self.top - index >= Self::SIZE {
+        } else if self.top - index >= Self::SIZE {
             return false;
         }
         let (w, b) = Self::bit(index);
