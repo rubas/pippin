@@ -485,6 +485,8 @@ mod tests {
         let (mut client, server) = UnixStream::pair().unwrap();
         let host = thread::spawn(move || serve(server, host_password, host).unwrap());
         let result = srp_auth(&mut client, "alice", client_password);
+        // An early client error must end the host's read, not hang the join.
+        drop(client);
         (result, host.join().unwrap())
     }
 
