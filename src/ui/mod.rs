@@ -121,9 +121,8 @@ impl App {
 
     fn send_resize(&mut self) {
         let (Some(req), Some(s)) = (self.display_request(), &self.session) else { return };
-        if self.last_request != Some(req) {
+        if self.last_request != Some(req) && s.resize(req) {
             self.last_request = Some(req);
-            s.resize(req);
         }
     }
 
