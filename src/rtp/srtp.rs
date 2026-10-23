@@ -49,12 +49,13 @@ impl SessionKeys {
         k
     }
 
-    fn tag(&self, parts: &[&[u8]]) -> [u8; TAG_LEN] {
-        let mut m = <HmacSha1 as Mac>::new_from_slice(&self.auth).expect("any key length");
-        for p in parts {
-            m.update(p);
-        }
-        m.finalize().into_bytes()[..TAG_LEN].try_into().unwrap()
+    /// The HMAC over `authenticated`, ready for a trailing ROC.
+    fn mac(&self, authenticated: &[u8]) -> HmacSha1 {
+        <HmacSha1 as Mac>::new_from_slice(&self.auth).expect("any key length").chain_update(authenticated)
+    }
+
+    fn tag(mac: HmacSha1) -> [u8; TAG_LEN] {
+        mac.finalize().into_bytes()[..TAG_LEN].try_into().unwrap()
     }
 
     fn rtp_iv(&self, ssrc: u32, index: u64) -> [u8; 16] {
@@ -155,9 +156,11 @@ impl SrtpReceiver {
                 }
             }
         };
+        // verify_truncated_left compares in constant time.
+        let mac = self.keys.mac(body);
         let roc = [guess, guess + 1, guess.saturating_sub(1)]
             .into_iter()
-            .find(|r| self.keys.tag(&[body, &r.to_be_bytes()]) == tag)?;
+            .find(|r| mac.clone().chain_update(r.to_be_bytes()).verify_truncated_left(tag).is_ok())?;
 
         let cc = (pkt[0] & 0x0f) as usize;
         let mut hdr = RTP_HEADER + 4 * cc;
@@ -214,7 +217,7 @@ impl SrtpSender {
         out.extend_from_slice(&self.ssrc.to_be_bytes());
         out.extend_from_slice(payload);
         self.keys.apply(self.keys.rtp_iv(self.ssrc, self.index), &mut out[RTP_HEADER..]);
-        let tag = self.keys.tag(&[&out, &roc.to_be_bytes()]);
+        let tag = SessionKeys::tag(self.keys.mac(&out).chain_update(roc.to_be_bytes()));
         out.extend_from_slice(&tag);
         self.index += 1;
         self.ts = self.ts.wrapping_add(480);
@@ -241,7 +244,7 @@ impl SrtcpSender {
         let mut out = rtcp.to_vec();
         self.keys.apply(self.keys.rtcp_iv(ssrc, index), &mut out[8..]);
         out.extend_from_slice(&(0x8000_0000 | index).to_be_bytes());
-        let tag = self.keys.tag(&[&out]);
+        let tag = SessionKeys::tag(self.keys.mac(&out));
         out.extend_from_slice(&tag);
         out
     }
@@ -262,7 +265,7 @@ impl SrtcpReceiver {
             return None;
         }
         let (body, tag) = pkt.split_at(pkt.len() - TAG_LEN);
-        if self.keys.tag(&[body]) != tag {
+        if self.keys.mac(body).verify_truncated_left(tag).is_err() {
             return None;
         }
         let e_index = u32::from_be_bytes(body[body.len() - 4..].try_into().unwrap());
@@ -296,6 +299,18 @@ mod tests {
             assert_eq!(rx.last_index(), 0xfffe + i);
         }
         assert_eq!(rx.extended_seq(0x1234_5678), Some(0x1_0001));
+    }
+
+    #[test]
+    fn rtp_with_one_tag_bit_flipped_is_rejected() {
+        let blob = [0x42u8; SRTP_BLOB_LEN];
+        let mut tx = SrtpSender::new(&blob, 0x1234_5678);
+        let mut rx = SrtpReceiver::new(&blob);
+        let mut pkt = tx.protect(101, b"\x00\x68\x34\x00");
+        *pkt.last_mut().unwrap() ^= 0x01;
+        assert!(rx.unprotect(&pkt).is_none());
+        *pkt.last_mut().unwrap() ^= 0x01;
+        assert_eq!(rx.unprotect(&pkt).unwrap().payload, b"\x00\x68\x34\x00");
     }
 
     #[test]
