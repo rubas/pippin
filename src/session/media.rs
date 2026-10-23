@@ -3,7 +3,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::io::ErrorKind;
-use std::net::{SocketAddrV4, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -134,22 +134,34 @@ enum Datagram {
     Rtp(RtpPacket),
     /// The plain compound RTCP packet.
     Rtcp(Vec<u8>),
-    /// Failed authentication, or malformed.
+    /// Failed authentication, a replay, or malformed.
     Rejected,
+    /// Not sent by the host of the session.
+    Foreign,
 }
 
-/// Unprotects the SRTP and the SRTCP packets of one media port.
+/// Unprotects the SRTP and the SRTCP packets that the host sends to one
+/// media port.
 struct Demux {
+    host: Ipv4Addr,
     srtp: SrtpReceiver,
     srtcp: SrtcpReceiver,
+    foreign: u64,
 }
 
 impl Demux {
-    fn new(rtp_key: &[u8; SRTP_BLOB_LEN], rtcp_key: &[u8; SRTP_BLOB_LEN]) -> Self {
-        Self { srtp: SrtpReceiver::new(rtp_key), srtcp: SrtcpReceiver::new(rtcp_key) }
+    fn new(host: Ipv4Addr, rtp_key: &[u8; SRTP_BLOB_LEN], rtcp_key: &[u8; SRTP_BLOB_LEN]) -> Self {
+        Self { host, srtp: SrtpReceiver::new(rtp_key), srtcp: SrtcpReceiver::new(rtcp_key), foreign: 0 }
     }
 
-    fn receive(&mut self, pkt: &[u8]) -> Datagram {
+    fn receive(&mut self, from: SocketAddr, pkt: &[u8]) -> Datagram {
+        if from.ip() != IpAddr::V4(self.host) {
+            self.foreign += 1;
+            if self.foreign.is_power_of_two() {
+                tracing::debug!("{} packets dropped that did not come from the host, the last from {from}", self.foreign);
+            }
+            return Datagram::Foreign;
+        }
         let got = if is_rtcp(pkt) {
             self.srtcp.unprotect(pkt).map(Datagram::Rtcp)
         } else {
@@ -318,11 +330,12 @@ impl LossStats {
 pub(super) fn video_rx(
     shared: Arc<Shared>,
     sock: UdpSocket,
+    host: Ipv4Addr,
     key: [u8; SRTP_BLOB_LEN],
     dec: Sender<DecoderMsg>,
     fb: Sender<Feedback>,
 ) {
-    let mut demux = Demux::new(&key, &key);
+    let mut demux = Demux::new(host, &key, &key);
     let mut asm = Assembler::default();
     let mut tiles = TileMap::default();
     let mut next_seq: HashMap<u32, u16> = HashMap::new();
@@ -343,7 +356,7 @@ pub(super) fn video_rx(
 
     while !shared.stopped() {
         match sock.recv_from(&mut buf) {
-            Ok((n, _)) => match demux.receive(&buf[..n]) {
+            Ok((n, from)) => match demux.receive(from, &buf[..n]) {
                 Datagram::Rtcp(data) => record_sender_reports(&shared, &data),
                 Datagram::Rtp(p) => {
                     let now = Instant::now();
@@ -411,7 +424,7 @@ pub(super) fn video_rx(
                         tracing::debug!("{bad} undecryptable packets on the video port");
                     }
                 }
-                Datagram::Rejected => {}
+                Datagram::Rejected | Datagram::Foreign => {}
             },
             Err(e) if is_timeout(&e) => {}
             Err(e) => {
@@ -485,11 +498,12 @@ pub(super) fn video_rx(
 pub(super) fn ctrl_rx(
     shared: Arc<Shared>,
     sock: UdpSocket,
+    host: Ipv4Addr,
     key: [u8; SRTP_BLOB_LEN],
     audio_key: [u8; SRTP_BLOB_LEN],
     player: Option<Player>,
 ) {
-    let mut demux = Demux::new(&audio_key, &key);
+    let mut demux = Demux::new(host, &audio_key, &key);
     let mut audio = player.and_then(|player| match AudioRx::new(player) {
         Ok(rx) => Some(rx),
         Err(e) => {
@@ -500,14 +514,14 @@ pub(super) fn ctrl_rx(
     let mut buf = vec![0u8; 65536];
     while !shared.stopped() {
         match sock.recv_from(&mut buf) {
-            Ok((n, _)) => match demux.receive(&buf[..n]) {
+            Ok((n, from)) => match demux.receive(from, &buf[..n]) {
                 Datagram::Rtcp(data) => record_sender_reports(&shared, &data),
                 Datagram::Rtp(rtp) => {
                     if let Some(a) = audio.as_mut() {
                         a.packet(rtp);
                     }
                 }
-                Datagram::Rejected => {}
+                Datagram::Rejected | Datagram::Foreign => {}
             },
             Err(e) if is_timeout(&e) => {}
             Err(e) => {
@@ -1282,6 +1296,7 @@ mod tests {
     use super::*;
 
     const KEY: [u8; SRTP_BLOB_LEN] = [0x5a; SRTP_BLOB_LEN];
+    const HOST: Ipv4Addr = Ipv4Addr::new(192, 168, 5, 239);
     /// A sender report from SSRC 0x0a0b0c0d with no report blocks.
     const SR: [u8; 28] = [
         0x80, 200, 0, 6, 0x0a, 0x0b, 0x0c, 0x0d, 0xea, 0x1c, 0x2d, 0x3e, 0x40, 0, 0, 0, 0, 1, 0x5f, 0x90, 0, 0, 0, 9, 0,
@@ -1295,6 +1310,7 @@ mod tests {
             Datagram::Rtp(p) => ("rtp", p.payload),
             Datagram::Rtcp(data) => ("rtcp", data),
             Datagram::Rejected => ("rejected", Vec::new()),
+            Datagram::Foreign => ("foreign", Vec::new()),
         }
     }
 
@@ -1319,7 +1335,8 @@ mod tests {
         let mut rtp = SrtpSender::new(&KEY, 0x1111_2222);
         let mut rtcp = SrtcpSender::new(&KEY);
         let mut foreign = SrtcpSender::new(&[0x77; SRTP_BLOB_LEN]);
-        let mut demux = Demux::new(&KEY, &KEY);
+        let mut demux = Demux::new(HOST, &KEY, &KEY);
+        let from = SocketAddr::from((HOST, 5901));
         let got: Vec<_> = [
             rtp.protect(100, &[1, 2, 3]),
             rtcp.protect(&SR),
@@ -1328,7 +1345,7 @@ mod tests {
             foreign.protect(&RR),
         ]
         .iter()
-        .map(|p| describe(demux.receive(p)))
+        .map(|p| describe(demux.receive(from, p)))
         .collect();
         assert_eq!(
             got,
@@ -1340,6 +1357,25 @@ mod tests {
                 ("rejected", vec![]),
             ]
         );
+    }
+
+    #[test]
+    fn demux_drops_packets_from_another_address_and_replays() {
+        let mut rtp = SrtpSender::new(&KEY, 0x1111_2222);
+        let mut rtcp = SrtcpSender::new(&KEY);
+        let mut demux = Demux::new(HOST, &KEY, &KEY);
+        let (video, sr) = (rtp.protect(100, &[1, 2, 3]), rtcp.protect(&SR));
+        let host = SocketAddr::from((HOST, 5901));
+        // Another machine on the LAN sends the host's own packets.
+        let other = SocketAddr::from(([192, 168, 5, 240], 5901));
+        let got: Vec<_> = [(other, &video), (other, &sr), (host, &video), (host, &sr), (host, &video), (host, &sr)]
+            .into_iter()
+            .map(|(from, p)| describe(demux.receive(from, p)).0)
+            .collect();
+        assert_eq!(got, ["foreign", "foreign", "rtp", "rtcp", "rejected", "rejected"]);
+        // Only the address counts, not the port.
+        let host_other_port = SocketAddr::from((HOST, 49152));
+        assert_eq!(describe(demux.receive(host_other_port, &rtp.protect(100, &[4]))), ("rtp", vec![4]));
     }
 
     #[test]

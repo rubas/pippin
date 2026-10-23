@@ -580,8 +580,8 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
 
     {
         let (shared, fb, sock) = (shared.clone(), fb_tx.clone(), video_sock.try_clone()?);
-        let (key, dec_tx) = (neg.offer.video_key_s, dec_tx.clone());
-        spawn(threads, "video-rx", move || media::video_rx(shared, sock, key, dec_tx, fb));
+        let (host, key, dec_tx) = (cfg.host, neg.offer.video_key_s, dec_tx.clone());
+        spawn(threads, "video-rx", move || media::video_rx(shared, sock, host, key, dec_tx, fb));
     }
     {
         let (shared, fb) = (shared.clone(), fb_tx.clone());
@@ -595,8 +595,8 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
     }
     {
         let (shared, sock) = (shared.clone(), ctrl_sock.try_clone()?);
-        let (key, audio_key, player) = (neg.offer.video_key_s, neg.offer.audio_key_s, cfg.audio.clone());
-        spawn(threads, "ctrl-rx", move || media::ctrl_rx(shared, sock, key, audio_key, player));
+        let (host, key, audio_key, player) = (cfg.host, neg.offer.video_key_s, neg.offer.audio_key_s, cfg.audio.clone());
+        spawn(threads, "ctrl-rx", move || media::ctrl_rx(shared, sock, host, key, audio_key, player));
     }
     {
         let shared = shared.clone();
