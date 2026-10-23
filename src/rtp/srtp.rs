@@ -194,6 +194,15 @@ impl SrtpReceiver {
         }
         let mut payload = body[hdr..].to_vec();
         self.keys.apply(self.keys.rtp_iv(ssrc, index), &mut payload);
+        if pkt[0] & 0x20 != 0 {
+            // Padding (RFC 3550 5.1): its last byte counts the padding
+            // bytes, itself included.
+            let pad = *payload.last()? as usize;
+            if pad == 0 || pad > payload.len() {
+                return None;
+            }
+            payload.truncate(payload.len() - pad);
+        }
         self.last_index = index;
 
         Some(RtpPacket {
@@ -383,6 +392,37 @@ mod tests {
         assert!(rx.unprotect(&a1).is_none());
         assert_eq!(rx.unprotect(&b2).unwrap(), rr(2));
         assert!(rx.unprotect(&b2).is_none());
+    }
+
+    /// An SRTP packet with the first header byte `b0`, ROC 0, and the
+    /// plain RTP payload `plain`.
+    fn seal(blob: &[u8; SRTP_BLOB_LEN], b0: u8, seq: u16, plain: &[u8]) -> Vec<u8> {
+        let (keys, ssrc) = (SessionKeys::derive(blob, false), 0x1234_5678u32);
+        let mut out = vec![b0, 100];
+        out.extend_from_slice(&seq.to_be_bytes());
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&ssrc.to_be_bytes());
+        out.extend_from_slice(plain);
+        keys.apply(keys.rtp_iv(ssrc, seq as u64), &mut out[RTP_HEADER..]);
+        let tag = SessionKeys::tag(keys.mac(&out).chain_update(0u32.to_be_bytes()));
+        out.extend_from_slice(&tag);
+        out
+    }
+
+    #[test]
+    fn rtp_padding_is_removed_from_the_payload() {
+        let blob = [0x42u8; SRTP_BLOB_LEN];
+        let mut rx = SrtpReceiver::new(&blob);
+        // P bit (0xa0): the last 3 bytes are padding, the count included.
+        let got = rx.unprotect(&seal(&blob, 0xa0, 1, &[0xaa, 0xbb, 0, 0, 3])).unwrap();
+        assert_eq!(got.payload, [0xaa, 0xbb]);
+        // Without the P bit the same bytes are all payload.
+        let got = rx.unprotect(&seal(&blob, 0x80, 2, &[0xaa, 0xbb, 0, 0, 3])).unwrap();
+        assert_eq!(got.payload, [0xaa, 0xbb, 0, 0, 3]);
+        // A count of 0, or of more bytes than the payload has, is malformed.
+        assert!(rx.unprotect(&seal(&blob, 0xa0, 3, &[0xaa, 0])).is_none());
+        assert!(rx.unprotect(&seal(&blob, 0xa0, 4, &[0xaa, 3])).is_none());
+        assert!(rx.unprotect(&seal(&blob, 0xa0, 5, &[])).is_none());
     }
 
     #[test]
