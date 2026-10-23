@@ -9,6 +9,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
+use parking_lot::Mutex;
 
 use super::{AfterLoss, Event, Shared};
 use crate::audio::Player;
@@ -142,16 +143,18 @@ enum Datagram {
 
 /// Unprotects the SRTP and the SRTCP packets that the host sends to one
 /// media port.
-struct Demux {
+pub(super) struct Demux {
     host: Ipv4Addr,
     srtp: SrtpReceiver,
-    srtcp: SrtcpReceiver,
+    /// Both media ports get SRTCP under the same key, so they share one
+    /// replay list: a report taken on one port is a replay on the other.
+    srtcp: Arc<Mutex<SrtcpReceiver>>,
     foreign: u64,
 }
 
 impl Demux {
-    fn new(host: Ipv4Addr, rtp_key: &[u8; SRTP_BLOB_LEN], rtcp_key: &[u8; SRTP_BLOB_LEN]) -> Self {
-        Self { host, srtp: SrtpReceiver::new(rtp_key), srtcp: SrtcpReceiver::new(rtcp_key), foreign: 0 }
+    pub(super) fn new(host: Ipv4Addr, rtp_key: &[u8; SRTP_BLOB_LEN], srtcp: Arc<Mutex<SrtcpReceiver>>) -> Self {
+        Self { host, srtp: SrtpReceiver::new(rtp_key), srtcp, foreign: 0 }
     }
 
     fn receive(&mut self, from: SocketAddr, pkt: &[u8]) -> Datagram {
@@ -163,7 +166,7 @@ impl Demux {
             return Datagram::Foreign;
         }
         let got = if is_rtcp(pkt) {
-            self.srtcp.unprotect(pkt).map(Datagram::Rtcp)
+            self.srtcp.lock().unprotect(pkt).map(Datagram::Rtcp)
         } else {
             self.srtp.unprotect(pkt).map(Datagram::Rtp)
         };
@@ -330,12 +333,10 @@ impl LossStats {
 pub(super) fn video_rx(
     shared: Arc<Shared>,
     sock: UdpSocket,
-    host: Ipv4Addr,
-    key: [u8; SRTP_BLOB_LEN],
+    mut demux: Demux,
     dec: Sender<DecoderMsg>,
     fb: Sender<Feedback>,
 ) {
-    let mut demux = Demux::new(host, &key, &key);
     let mut asm = Assembler::default();
     let mut tiles = TileMap::default();
     let mut next_seq: HashMap<u32, u16> = HashMap::new();
@@ -497,12 +498,9 @@ pub(super) fn video_rx(
 pub(super) fn ctrl_rx(
     shared: Arc<Shared>,
     sock: UdpSocket,
-    host: Ipv4Addr,
-    key: [u8; SRTP_BLOB_LEN],
-    audio_key: [u8; SRTP_BLOB_LEN],
+    mut demux: Demux,
     player: Option<Player>,
 ) {
-    let mut demux = Demux::new(host, &audio_key, &key);
     let mut audio = player.and_then(|player| match AudioRx::new(player) {
         Ok(rx) => Some(rx),
         Err(e) => {
@@ -1304,6 +1302,10 @@ mod tests {
     /// An empty receiver report from the same SSRC.
     const RR: [u8; 8] = [0x80, 201, 0, 1, 0x0a, 0x0b, 0x0c, 0x0d];
 
+    fn demux() -> Demux {
+        Demux::new(HOST, &KEY, Arc::new(Mutex::new(SrtcpReceiver::new(&KEY))))
+    }
+
     fn describe(d: Datagram) -> (&'static str, Vec<u8>) {
         match d {
             Datagram::Rtp(p) => ("rtp", p.payload),
@@ -1334,7 +1336,7 @@ mod tests {
         let mut rtp = SrtpSender::new(&KEY, 0x1111_2222);
         let mut rtcp = SrtcpSender::new(&KEY);
         let mut foreign = SrtcpSender::new(&[0x77; SRTP_BLOB_LEN]);
-        let mut demux = Demux::new(HOST, &KEY, &KEY);
+        let mut demux = demux();
         let from = SocketAddr::from((HOST, 5901));
         let got: Vec<_> = [
             rtp.protect(100, &[1, 2, 3]),
@@ -1362,7 +1364,7 @@ mod tests {
     fn demux_drops_packets_from_another_address_and_replays() {
         let mut rtp = SrtpSender::new(&KEY, 0x1111_2222);
         let mut rtcp = SrtcpSender::new(&KEY);
-        let mut demux = Demux::new(HOST, &KEY, &KEY);
+        let mut demux = demux();
         let (video, sr) = (rtp.protect(100, &[1, 2, 3]), rtcp.protect(&SR));
         let host = SocketAddr::from((HOST, 5901));
         // Another machine on the LAN sends the host's own packets.
@@ -1376,6 +1378,21 @@ mod tests {
         // Only the address counts, not the port.
         let host_other_port = SocketAddr::from((HOST, 49152));
         assert_eq!(describe(demux.receive(host_other_port, &rtp.protect(100, &[4]))), ("rtp", vec![4]));
+    }
+
+    #[test]
+    fn sender_report_taken_on_one_port_is_a_replay_on_the_other() {
+        let srtcp = Arc::new(Mutex::new(SrtcpReceiver::new(&KEY)));
+        let mut video = Demux::new(HOST, &KEY, srtcp.clone());
+        let mut ctrl = Demux::new(HOST, &[0x33; SRTP_BLOB_LEN], srtcp);
+        let mut rtcp = SrtcpSender::new(&KEY);
+        let (sr, rr) = (rtcp.protect(&SR), rtcp.protect(&RR));
+        let from = SocketAddr::from((HOST, 5901));
+        assert_eq!(describe(video.receive(from, &sr)), ("rtcp", SR.to_vec()));
+        assert_eq!(describe(ctrl.receive(from, &sr)).0, "rejected");
+        // The next index is new on either port.
+        assert_eq!(describe(ctrl.receive(from, &rr)), ("rtcp", RR.to_vec()));
+        assert_eq!(describe(video.receive(from, &rr)).0, "rejected");
     }
 
     #[test]

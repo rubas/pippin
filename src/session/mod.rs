@@ -38,6 +38,7 @@ use crate::proto::handshake::{self, ConnectParams, SessionMode};
 use crate::proto::messages::{self, DisplayRequest};
 use crate::proto::offers::{MediaOffer, OfferOptions};
 use crate::proto::record::RecordSealer;
+use crate::rtp::srtp::SrtcpReceiver;
 use crate::rtp::stats::ReceiverStats;
 use crate::video::decoder::{DecoderKind, Picture};
 
@@ -578,10 +579,13 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
     let (dec_tx, dec_rx) = crossbeam_channel::bounded(256);
     let (clip_tx, clip_rx) = crossbeam_channel::unbounded();
 
+    // The host seals its RTCP with the video key on both ports.
+    let srtcp = Arc::new(Mutex::new(SrtcpReceiver::new(&neg.offer.video_key_s)));
     {
         let (shared, fb, sock) = (shared.clone(), fb_tx.clone(), video_sock.try_clone()?);
-        let (host, key, dec_tx) = (cfg.host, neg.offer.video_key_s, dec_tx.clone());
-        spawn(threads, "video-rx", move || media::video_rx(shared, sock, host, key, dec_tx, fb));
+        let demux = media::Demux::new(cfg.host, &neg.offer.video_key_s, srtcp.clone());
+        let dec_tx = dec_tx.clone();
+        spawn(threads, "video-rx", move || media::video_rx(shared, sock, demux, dec_tx, fb));
     }
     {
         let (shared, fb) = (shared.clone(), fb_tx.clone());
@@ -595,9 +599,9 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
     }
     {
         let (shared, sock) = (shared.clone(), ctrl_sock.try_clone()?);
-        let (host, key, audio_key) = (cfg.host, neg.offer.video_key_s, neg.offer.audio_key_s);
+        let demux = media::Demux::new(cfg.host, &neg.offer.audio_key_s, srtcp);
         let player = cfg.audio.clone();
-        spawn(threads, "ctrl-rx", move || media::ctrl_rx(shared, sock, host, key, audio_key, player));
+        spawn(threads, "ctrl-rx", move || media::ctrl_rx(shared, sock, demux, player));
     }
     {
         let shared = shared.clone();
