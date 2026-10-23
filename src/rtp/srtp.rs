@@ -1,12 +1,14 @@
 //! SRTP / SRTCP (RFC 3711) with AES-256-CM and HMAC-SHA1-80.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use aes::Aes256;
 use aes::cipher::{BlockEncrypt, KeyInit, KeyIvInit, StreamCipher, generic_array::GenericArray};
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 
+use super::window::SeenWindow;
 use crate::proto::offers::SRTP_BLOB_LEN;
 
 const TAG_LEN: usize = 10;
@@ -97,16 +99,22 @@ pub struct RtpPacket {
     pub payload: Vec<u8>,
 }
 
-#[derive(Default, Clone, Copy)]
-struct RocState {
-    roc: u32,
-    max_seq: u16,
-}
+/// The replay list of one SSRC (RFC 3711 3.3.2). A packet up to half the
+/// sequence space behind the newest is late, not new: the same horizon as
+/// the rollover estimate in `unprotect`. So a retransmission that comes
+/// after a long hold, or behind a keyframe of thousands of packets, still
+/// gets through, once.
+type RtpWindow = SeenWindow<{ 0x8000 / 64 }>;
 
-/// SRTP receiver with per-SSRC rollover tracking.
+/// The SRTCP replay list of one sender SSRC: the RFC minimum of 64, as RTCP
+/// comes a few packets a second.
+type RtcpWindow = SeenWindow<1>;
+
+/// SRTP receiver with per-SSRC rollover tracking and replay protection.
 pub struct SrtpReceiver {
     keys: SessionKeys,
-    states: HashMap<u32, RocState>,
+    /// The highest index of each SSRC holds its rollover count.
+    states: HashMap<u32, RtpWindow>,
     /// SRTP index (ROC << 16 | seq) of the last packet unprotected.
     last_index: u64,
 }
@@ -126,7 +134,7 @@ impl SrtpReceiver {
     /// use `rtp::stats` instead; this checks the rollover tracking in tests.
     #[cfg(test)]
     pub fn extended_seq(&self, ssrc: u32) -> Option<u32> {
-        self.states.get(&ssrc).map(|s| (s.roc << 16) | s.max_seq as u32)
+        self.states.get(&ssrc).map(|w| w.top() as u32)
     }
 
     pub fn forget(&mut self, keep: impl Fn(u32) -> bool) {
@@ -142,17 +150,17 @@ impl SrtpReceiver {
         let seq = u16::from_be_bytes([pkt[2], pkt[3]]);
         let ssrc = u32::from_be_bytes(pkt[8..12].try_into().unwrap());
 
-        let state = self.states.get(&ssrc).copied();
-        let guess = match state {
+        let guess = match self.states.get(&ssrc) {
             None => 0,
-            Some(s) => {
-                let diff = seq as i32 - s.max_seq as i32;
+            Some(w) => {
+                let (roc, max_seq) = ((w.top() >> 16) as u32, w.top() as u16);
+                let diff = seq as i32 - max_seq as i32;
                 if diff > 0x7fff {
-                    s.roc.saturating_sub(1)
+                    roc.saturating_sub(1)
                 } else if diff < -0x7fff {
-                    s.roc + 1
+                    roc + 1
                 } else {
-                    s.roc
+                    roc
                 }
             }
         };
@@ -173,15 +181,20 @@ impl SrtpReceiver {
         if hdr > body_len {
             return None;
         }
-        let mut payload = body[hdr..].to_vec();
         let index = ((roc as u64) << 16) | seq as u64;
+        let fresh = match self.states.entry(ssrc) {
+            Entry::Occupied(mut e) => e.get_mut().insert(index),
+            Entry::Vacant(e) => {
+                e.insert(RtpWindow::new(index));
+                true
+            }
+        };
+        if !fresh {
+            return None;
+        }
+        let mut payload = body[hdr..].to_vec();
         self.keys.apply(self.keys.rtp_iv(ssrc, index), &mut payload);
         self.last_index = index;
-
-        let entry = self.states.entry(ssrc).or_insert(RocState { roc, max_seq: seq });
-        if ((roc as u64) << 16 | seq as u64) > ((entry.roc as u64) << 16 | entry.max_seq as u64) {
-            *entry = RocState { roc, max_seq: seq };
-        }
 
         Some(RtpPacket {
             ssrc,
@@ -250,17 +263,19 @@ impl SrtcpSender {
     }
 }
 
-/// SRTCP receiver.
+/// SRTCP receiver with replay protection.
 pub struct SrtcpReceiver {
     keys: SessionKeys,
+    /// The SRTCP indices seen per sender SSRC.
+    seen: HashMap<u32, RtcpWindow>,
 }
 
 impl SrtcpReceiver {
     pub fn new(blob: &[u8; SRTP_BLOB_LEN]) -> Self {
-        Self { keys: SessionKeys::derive(blob, true) }
+        Self { keys: SessionKeys::derive(blob, true), seen: HashMap::new() }
     }
 
-    pub fn unprotect(&self, pkt: &[u8]) -> Option<Vec<u8>> {
+    pub fn unprotect(&mut self, pkt: &[u8]) -> Option<Vec<u8>> {
         if pkt.len() < 8 + 4 + TAG_LEN {
             return None;
         }
@@ -269,10 +284,21 @@ impl SrtcpReceiver {
             return None;
         }
         let e_index = u32::from_be_bytes(body[body.len() - 4..].try_into().unwrap());
+        let index = e_index & 0x7fff_ffff;
+        let ssrc = u32::from_be_bytes(body[4..8].try_into().unwrap());
+        let fresh = match self.seen.entry(ssrc) {
+            Entry::Occupied(mut e) => e.get_mut().insert(index as u64),
+            Entry::Vacant(e) => {
+                e.insert(RtcpWindow::new(index as u64));
+                true
+            }
+        };
+        if !fresh {
+            return None;
+        }
         let mut out = body[..body.len() - 4].to_vec();
         if e_index & 0x8000_0000 != 0 {
-            let ssrc = u32::from_be_bytes(out[4..8].try_into().unwrap());
-            self.keys.apply(self.keys.rtcp_iv(ssrc, e_index & 0x7fff_ffff), &mut out[8..]);
+            self.keys.apply(self.keys.rtcp_iv(ssrc, index), &mut out[8..]);
         }
         Some(out)
     }
@@ -314,10 +340,56 @@ mod tests {
     }
 
     #[test]
+    fn rtp_packet_is_accepted_once_also_when_late() {
+        let blob = [0x42u8; SRTP_BLOB_LEN];
+        let mut tx = SrtpSender::new(&blob, 0x1234_5678);
+        let mut rx = SrtpReceiver::new(&blob);
+        let p: Vec<_> = (0..3).map(|_| tx.protect(101, b"\x01")).collect();
+        let seqs = |rx: &mut SrtpReceiver, order: &[usize]| -> Vec<Option<u16>> {
+            order.iter().map(|&i| rx.unprotect(&p[i]).map(|r| r.seq)).collect()
+        };
+        // Seq 1 comes late, then every packet comes again.
+        assert_eq!(seqs(&mut rx, &[0, 2, 1]), [Some(0), Some(2), Some(1)]);
+        assert_eq!(seqs(&mut rx, &[0, 1, 2]), [None, None, None]);
+    }
+
+    #[test]
+    fn rtp_half_the_sequence_space_behind_is_refused() {
+        let blob = [0x42u8; SRTP_BLOB_LEN];
+        let mut tx = SrtpSender::new(&blob, 0x1234_5678);
+        let mut rx = SrtpReceiver::new(&blob);
+        tx.index = 5;
+        let (p5, p6) = (tx.protect(101, b"\x01"), tx.protect(101, b"\x01"));
+        tx.index = 5 + 0x8000;
+        assert!(rx.unprotect(&tx.protect(101, b"\x01")).is_some());
+        // Seq 5 is 0x8000 behind seq 0x8005: too old to tell. Seq 6 is
+        // 0x7fff behind, the last one the window holds.
+        assert!(rx.unprotect(&p5).is_none());
+        assert_eq!(rx.unprotect(&p6).map(|r| r.seq), Some(6));
+        assert_eq!(rx.extended_seq(0x1234_5678), Some(0x8005));
+    }
+
+    #[test]
+    fn srtcp_index_is_accepted_once_per_sender() {
+        let blob = [7u8; SRTP_BLOB_LEN];
+        let mut tx = SrtcpSender::new(&blob);
+        let mut rx = SrtcpReceiver::new(&blob);
+        let rr = |ssrc: u8| [0x80, 201, 0, 1, 0, 0, 0, ssrc];
+        // SRTCP indices 0 and 1 from SSRC 1, then 2 from SSRC 2.
+        let (a0, a1, b2) = (tx.protect(&rr(1)), tx.protect(&rr(1)), tx.protect(&rr(2)));
+        assert!(rx.unprotect(&a1).is_some());
+        assert!(rx.unprotect(&a0).is_some());
+        assert!(rx.unprotect(&a0).is_none());
+        assert!(rx.unprotect(&a1).is_none());
+        assert_eq!(rx.unprotect(&b2).unwrap(), rr(2));
+        assert!(rx.unprotect(&b2).is_none());
+    }
+
+    #[test]
     fn rtcp_round_trip() {
         let blob = [7u8; SRTP_BLOB_LEN];
         let mut tx = SrtcpSender::new(&blob);
-        let rx = SrtcpReceiver::new(&blob);
+        let mut rx = SrtcpReceiver::new(&blob);
         let rr = [0x80, 201, 0, 1, 1, 2, 3, 4];
         let sealed = tx.protect(&rr);
         assert_eq!(sealed.len(), 8 + 4 + 10);
