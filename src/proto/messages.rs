@@ -74,17 +74,32 @@ pub struct DisplayRequest {
 }
 
 impl DisplayRequest {
+    /// Smallest logical size we ask for.
+    const MIN_POINTS: (u32, u32) = (640, 360);
+
     /// Picks the logical size and scale so that the host's backing store
-    /// matches `px_w`×`px_h` pixels as closely as `max_backing` allows.
+    /// matches `px_w`×`px_h` pixels as closely as `max_backing` allows. The
+    /// backing never exceeds `max_backing`: when the smallest logical size
+    /// does not fit at `scale`, the scale goes down.
     pub fn for_pixels(px_w: u32, px_h: u32, scale: f64, max_backing: (u32, u32)) -> Self {
-        let scale = scale.clamp(0.5, 3.0);
         let (max_w, max_h) = max_backing;
+        let (min_w, min_h) = Self::MIN_POINTS;
+        let scale = scale
+            .clamp(0.5, 3.0)
+            .min(max_w as f64 / min_w as f64)
+            .min(max_h as f64 / min_h as f64);
         let fit = (max_w as f64 / px_w.max(1) as f64)
             .min(max_h as f64 / px_h.max(1) as f64)
             .min(1.0);
-        let even = |v: f64| ((v / 2.0).round() as u32 * 2).max(2);
-        let width = even(px_w as f64 * fit / scale).max(640);
-        let height = even(px_h as f64 * fit / scale).max(360);
+        // The nearest even size, but at most the largest even size whose
+        // backing fits.
+        let points = |px: u32, max: u32, min: u32| {
+            let near = (px as f64 * fit / scale / 2.0).round() as u32 * 2;
+            let most = (max as f64 / scale / 2.0) as u32 * 2;
+            near.min(most).max(min)
+        };
+        let width = points(px_w, max_w, min_w);
+        let height = points(px_h, max_h, min_h);
         Self { width, height, scale, max_backing }
     }
 
@@ -325,6 +340,25 @@ mod tests {
         let r = DisplayRequest::for_pixels(6016, 3304, 2.0, (5120, 2880));
         assert_eq!((r.width, r.height), (2560, 1406));
         assert_eq!(r.backing(), (5120, 2812));
+    }
+
+    #[test]
+    fn display_request_rounds_an_odd_half_down_into_the_maximum() {
+        // 1366 / 2 = 683 points; the nearest even 684 would need 1368 pixels.
+        let r = DisplayRequest::for_pixels(1366, 768, 2.0, (1366, 768));
+        assert_eq!((r.width, r.height), (682, 384));
+        assert_eq!(r.backing(), (1364, 768));
+    }
+
+    #[test]
+    fn display_request_lowers_the_scale_when_the_smallest_size_exceeds_the_maximum() {
+        // 640×360 points at 2× would need 1280×720 pixels.
+        let r = DisplayRequest::for_pixels(1280, 720, 2.0, (640, 360));
+        assert_eq!((r.width, r.height, r.scale), (640, 360, 1.0));
+        assert_eq!(r.backing(), (640, 360));
+        let r = DisplayRequest::for_pixels(6016, 3304, 2.0, (1024, 576));
+        assert_eq!((r.width, r.height), (640, 360));
+        assert_eq!(r.backing(), (1024, 576));
     }
 
     #[test]
