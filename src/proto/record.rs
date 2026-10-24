@@ -75,7 +75,8 @@ impl RecordSealer {
     /// Wraps one message into as many records as it needs, each with at most
     /// [`MAX_RECORD_MSG`] bytes. Only clipboard messages need more than one.
     pub fn seal(&mut self, msg: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(msg.len() + 2 + 2 + BLOCK + MAC_LEN);
+        let records = msg.len().div_ceil(MAX_RECORD_MSG).max(1);
+        let mut out = Vec::with_capacity(msg.len() + records * (2 + 2 + BLOCK + MAC_LEN));
         let mut rest = msg;
         loop {
             let (head, tail) = rest.split_at(rest.len().min(MAX_RECORD_MSG));
