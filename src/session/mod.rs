@@ -248,6 +248,11 @@ pub struct Shared {
     /// since the video receiver last logged it.
     recovered_damaged: AtomicU32,
     canvas: Mutex<Option<(u32, u32)>>,
+    /// The maximum of the first display request. macOS 27 keeps it for the
+    /// whole session, and answers a later request that exceeds it with a
+    /// smaller display of its own choice. `None` when the session streams
+    /// the Mac's own display: then pippin never sends a display request.
+    max_backing: Option<(u32, u32)>,
     /// The latest display layout, to place the pointer of the control FIFO
     /// in points.
     display: Mutex<Option<DisplaySize>>,
@@ -260,7 +265,7 @@ pub struct Shared {
 }
 
 impl Shared {
-    fn new(op: SharedOp, sink: Arc<dyn EventSink>) -> Self {
+    fn new(op: SharedOp, sink: Arc<dyn EventSink>, max_backing: Option<(u32, u32)>) -> Self {
         Shared {
             clock: Clock(Instant::now()),
             stop: AtomicBool::new(false),
@@ -277,6 +282,7 @@ impl Shared {
             rtt: Mutex::new(None),
             recovered_damaged: AtomicU32::new(0),
             canvas: Mutex::new(None),
+            max_backing,
             display: Mutex::new(None),
             connecting: Mutex::new(None),
             udp: Mutex::new(Vec::new()),
@@ -320,19 +326,16 @@ impl Shared {
 pub struct Session {
     shared: Arc<Shared>,
     threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
-    /// The maximum of the first display request. macOS 27 keeps it for
-    /// the whole session, and answers a later request that exceeds it
-    /// with a smaller display of its own choice.
-    max_backing: (u32, u32),
 }
 
 impl Session {
     /// Starts connecting in the background. Progress and failures arrive as
-    /// [`Event`]s.
-    pub fn start(cfg: Config, display: DisplayRequest, sink: Arc<dyn EventSink>) -> Self {
-        let shared = Arc::new(Shared::new(cfg.op.clone(), sink));
+    /// [`Event`]s. With `display`, the Mac creates a virtual display for the
+    /// session; with `None`, it streams its own main display.
+    pub fn start(cfg: Config, display: Option<DisplayRequest>, sink: Arc<dyn EventSink>) -> Self {
+        let shared = Arc::new(Shared::new(cfg.op.clone(), sink, display.map(|d| d.max_backing)));
         let threads = Arc::new(Mutex::new(Vec::new()));
-        let session = Session { shared: shared.clone(), threads: threads.clone(), max_backing: display.max_backing };
+        let session = Session { shared: shared.clone(), threads: threads.clone() };
         let main = thread::Builder::new()
             .name("control".into())
             .spawn(move || {
@@ -378,15 +381,18 @@ impl Session {
         }
     }
 
-    /// The maximum that each display request of this session must carry.
-    pub fn max_backing(&self) -> (u32, u32) {
-        self.max_backing
+    /// The maximum that each display request of this session must carry,
+    /// `None` when the session streams the Mac's own display.
+    pub fn max_backing(&self) -> Option<(u32, u32)> {
+        self.shared.max_backing
     }
 
-    /// Asks the host to resize its virtual display. Returns false before
-    /// the control connection is up, when nothing is sent.
+    /// Asks the host to resize its virtual display. Returns false, and sends
+    /// nothing, before the control connection is up and when the session
+    /// streams the Mac's own display: a display request there makes the Mac
+    /// create a virtual display after all.
     pub fn resize(&self, req: DisplayRequest) -> bool {
-        let Some(c) = self.control() else { return false };
+        let Some(c) = self.control().filter(|_| self.shared.max_backing.is_some()) else { return false };
         tracing::info!(
             width = req.width,
             height = req.height,
@@ -508,7 +514,7 @@ fn spawn(threads: &Mutex<Vec<JoinHandle<()>>>, name: &str, f: impl FnOnce() + Se
     threads.lock().push(t);
 }
 
-fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mutex<Vec<JoinHandle<()>>>) -> Result<()> {
+fn run(cfg: Config, display: Option<DisplayRequest>, shared: Arc<Shared>, threads: &Mutex<Vec<JoinHandle<()>>>) -> Result<()> {
     let addr = SocketAddrV4::new(cfg.host, cfg.port);
     let ctrl_dest = SocketAddrV4::new(cfg.host, cfg.port);
     let video_dest = SocketAddrV4::new(cfg.host, cfg.port + 1);
@@ -710,5 +716,90 @@ fn video_watchdog(shared: Arc<Shared>, host: Ipv4Addr, answered: bool, resumed: 
 impl Shared {
     pub(crate) fn is_stopped(&self) -> bool {
         self.stopped()
+    }
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+    use crate::proto::offers::MediaOffer;
+    use crate::proto::record::{Opened, RecordKeys, RecordOpener, RecordSealer};
+    use crate::rtp::{assembler::HoldMode, rtcp::Recovery};
+
+    pub const KEYS: RecordKeys = RecordKeys { key: [1; 16], iv: [2; 16] };
+
+    pub const OP: OperatingPoint = OperatingPoint {
+        render_scale: 1.0,
+        fps: Fps::Sixty,
+        recovery: Recovery::FirPli,
+        hold: HoldMode::Auto,
+        ltr: true,
+        after_loss: AfterLoss::Idr,
+    };
+
+    pub struct Sink(pub Sender<Event>);
+
+    impl EventSink for Sink {
+        fn emit(&self, event: Event) {
+            let _ = self.0.send(event);
+        }
+    }
+
+    /// The Mac's end of a control connection: it reads what pippin sends.
+    pub struct Host {
+        stream: TcpStream,
+        opener: RecordOpener,
+    }
+
+    impl Host {
+        /// The next message, or `None` when nothing arrives within 500 ms.
+        pub fn next(&mut self) -> Option<Vec<u8>> {
+            match self.opener.read(&mut self.stream) {
+                Ok(Opened::Message(m)) => Some(m),
+                _ => None,
+            }
+        }
+    }
+
+    /// Session state with a control connection to a local TCP peer in place
+    /// of the Mac, and its events.
+    pub fn connected(max_backing: Option<(u32, u32)>) -> (Arc<Shared>, Arc<Control>, Host, Receiver<Event>) {
+        let (events_tx, events) = crossbeam_channel::unbounded();
+        let shared = Arc::new(Shared::new(Arc::new(Mutex::new(OP)), Arc::new(Sink(events_tx)), max_backing));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let control = Arc::new(Control {
+            writer: Mutex::new((client, RecordSealer::new(&KEYS))),
+            record_key: KEYS.key,
+            video_ssrc: 1,
+            offer: Mutex::new(MediaOffer::generate(false, false, OP.offer_options())),
+        });
+        let _ = shared.control.set(control.clone());
+        (shared, control, Host { stream, opener: RecordOpener::new(&KEYS) }, events)
+    }
+
+    fn session(shared: Arc<Shared>) -> Session {
+        Session { shared, threads: Arc::new(Mutex::new(Vec::new())) }
+    }
+
+    const REQUEST: DisplayRequest = DisplayRequest { width: 1600, height: 900, scale: 2.0, max_backing: (3840, 2160) };
+
+    #[test]
+    fn a_resize_on_the_macs_own_display_sends_nothing() {
+        let (shared, _control, mut host, _events) = connected(None);
+        let session = session(shared);
+        assert_eq!(session.max_backing(), None);
+        assert!(!session.resize(REQUEST));
+        assert_eq!(host.next(), None);
+    }
+
+    #[test]
+    fn a_resize_on_a_virtual_display_sends_the_request() {
+        let (shared, _control, mut host, _events) = connected(Some((3840, 2160)));
+        let session = session(shared);
+        assert!(session.resize(REQUEST));
+        assert_eq!(host.next(), Some(messages::set_display_configuration(&REQUEST)));
     }
 }

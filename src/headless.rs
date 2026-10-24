@@ -20,16 +20,20 @@ impl EventSink for ChannelSink {
     }
 }
 
-/// Runs one session with a Mac display of `size` points at `scale` pixels
-/// per point. Only `quit` on the control FIFO ends it without an error,
-/// and only when no snapshot still waits. It does not reconnect, and a
-/// snapshot that fails to write ends it too.
-pub fn run(cfg: Config, size: (u32, u32), scale: f64) -> Result<()> {
+/// Runs one session. With `display`, the Mac creates a virtual display of
+/// that many points at that many pixels per point; with `None`, it streams
+/// its own main display. Only `quit` on the control FIFO ends it without an
+/// error, and only when no snapshot still waits. It does not reconnect, and
+/// a snapshot that fails to write ends it too.
+pub fn run(cfg: Config, display: Option<((u32, u32), f64)>) -> Result<()> {
     let op = cfg.op.clone();
-    let pixels = |v: u32| (v as f64 * scale).round() as u32;
-    // No monitor and no GPU texture limit: the Mac display never grows past the requested size.
-    let full = (pixels(size.0), pixels(size.1));
-    let request = move || crate::ui::display_request(full, scale, op.lock().render_scale, full);
+    let request = move || {
+        let (size, scale) = display?;
+        let pixels = |v: u32| (v as f64 * scale).round() as u32;
+        // No monitor and no GPU texture limit: the Mac display never grows past the requested size.
+        let full = (pixels(size.0), pixels(size.1));
+        Some(crate::ui::display_request(full, scale, op.lock().render_scale, full))
+    };
     let (tx, rx) = crossbeam_channel::unbounded();
     let session = Session::start(cfg, request(), Arc::new(ChannelSink(tx)));
     let result = serve(&session, &rx, request);
@@ -37,7 +41,7 @@ pub fn run(cfg: Config, size: (u32, u32), scale: f64) -> Result<()> {
     result
 }
 
-fn serve(session: &Session, events: &Receiver<Event>, request: impl Fn() -> DisplayRequest) -> Result<()> {
+fn serve(session: &Session, events: &Receiver<Event>, request: impl Fn() -> Option<DisplayRequest>) -> Result<()> {
     let mut canvas = Canvas::default();
     let mut snapshots = Vec::new();
     for event in events {
@@ -52,7 +56,9 @@ fn serve(session: &Session, events: &Receiver<Event>, request: impl Fn() -> Disp
             Event::Closed(reason) => return closed(reason, &snapshots),
             Event::Lost(reason) => bail!(reason),
             Event::Reconfigure => {
-                session.resize(request());
+                if let Some(req) = request() {
+                    session.resize(req);
+                }
             }
             Event::Snapshot(path) => snapshots.push(path),
         }

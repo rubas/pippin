@@ -38,7 +38,9 @@ pub struct ConnectParams {
     pub user: String,
     pub password: String,
     pub session_mode: SessionMode,
-    pub display: DisplayRequest,
+    /// The virtual display to ask the Mac for. `None` sends no display
+    /// request: the Mac then streams its own main display, as it is.
+    pub display: Option<DisplayRequest>,
     pub audio: bool,
     pub offer: OfferOptions,
     /// Shown each control connection as soon as it's open, so the caller
@@ -283,6 +285,14 @@ fn wait_readable(s: &TcpStream, timeout: Duration) -> Result<bool> {
     r
 }
 
+/// The display request, if any, and the encodings, which follow the viewer
+/// info. Without a display request, screensharingd creates no virtual
+/// display and streams the Mac's main display.
+fn display_and_encodings(display: Option<&DisplayRequest>) -> Vec<u8> {
+    let request = display.map(messages::set_display_configuration).unwrap_or_default();
+    [request, messages::set_encodings()].concat()
+}
+
 pub fn connect(p: &ConnectParams) -> Result<Negotiated> {
     let (mut s, mut auth_key) = authenticate(p)?;
     let mut server_size = client_init(&mut s)?;
@@ -303,8 +313,7 @@ pub fn connect(p: &ConnectParams) -> Result<Negotiated> {
 
     s.write_all(&messages::viewer_info())?;
     std::thread::sleep(Duration::from_millis(100));
-    s.write_all(&messages::set_display_configuration(&p.display))?;
-    s.write_all(&messages::set_encodings())?;
+    s.write_all(&display_and_encodings(p.display.as_ref()))?;
 
     let keys = read_record_keys(&mut s, &auth_key, &sealed).map_err(|e| {
         // A console user who refuses the share request just drops us.
@@ -419,6 +428,15 @@ mod tests {
 
         let e = read_record_keys(&mut &update[..], &AUTH_KEY, &sealed).err().unwrap();
         assert!(e.to_string().contains("reuse a block that we encrypted"), "{e:#}");
+    }
+
+    #[test]
+    fn only_a_virtual_display_sends_a_display_request() {
+        let req = DisplayRequest { width: 1600, height: 900, scale: 2.0, max_backing: (3840, 2160) };
+        let with = display_and_encodings(Some(&req));
+        assert_eq!(with[0], 0x1d, "SetDisplayConfiguration comes first");
+        assert_eq!(with, [messages::set_display_configuration(&req), messages::set_encodings()].concat());
+        assert_eq!(display_and_encodings(None), messages::set_encodings());
     }
 
     #[test]

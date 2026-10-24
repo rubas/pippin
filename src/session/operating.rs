@@ -299,6 +299,11 @@ fn pointer_pixels(at: Option<(u32, u32)>, display: Option<DisplaySize>) -> Resul
 /// once a `pointer` command placed it.
 fn run_command(shared: &Shared, control: &Control, fb: &Sender<Feedback>, pointer: &mut Option<(u32, u32)>, cmd: Command) {
     match cmd {
+        // A new render scale needs a display request, which the Mac's own
+        // display does not take.
+        Command::Set(Lever::RenderScale(_)) if shared.max_backing.is_none() => {
+            tracing::warn!("control FIFO: render_scale needs pippin's virtual display; this session streams the Mac's own display");
+        }
         Command::Set(lever) => {
             let mut op = shared.op();
             lever.set(&mut op);
@@ -554,44 +559,15 @@ mod tests {
         assert_eq!(lines.push(format!("{exact}\n").as_bytes()), vec![Some(exact)]);
     }
 
-    struct Sink(crossbeam_channel::Sender<Event>);
-
-    impl super::super::EventSink for Sink {
-        fn emit(&self, event: Event) {
-            let _ = self.0.send(event);
-        }
-    }
-
     /// Runs the FIFO reader with a local TCP pair in place of the Mac, and
     /// reads what reaches the other end.
     #[test]
     fn fifo_sends_input_and_stops_after_quit() {
         use crate::proto::messages::encrypted_pointer_event;
-        use crate::proto::offers::MediaOffer;
-        use crate::proto::record::{Opened, RecordKeys, RecordOpener, RecordSealer};
+        use crate::session::tests::{KEYS, connected};
 
-        let op = OperatingPoint {
-            render_scale: 1.0,
-            fps: Fps::Sixty,
-            recovery: Recovery::FirPli,
-            hold: HoldMode::Auto,
-            ltr: true,
-            after_loss: AfterLoss::Idr,
-        };
-        let (events_tx, events) = crossbeam_channel::unbounded();
-        let shared = Arc::new(Shared::new(Arc::new(Mutex::new(op)), Arc::new(Sink(events_tx))));
+        let (shared, control, mut host, events) = connected(Some((2560, 1440)));
         *shared.display.lock() = Some(DisplaySize { points: (1280, 720), pixels: (2560, 1440) });
-        let keys = RecordKeys { key: [1; 16], iv: [2; 16] };
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (mut host, _) = listener.accept().unwrap();
-        host.set_read_timeout(Some(std::time::Duration::from_millis(500))).unwrap();
-        let control = Arc::new(Control {
-            writer: Mutex::new((client, RecordSealer::new(&keys))),
-            record_key: keys.key,
-            video_ssrc: 1,
-            offer: Mutex::new(MediaOffer::generate(false, false, op.offer_options())),
-        });
         let path = std::env::temp_dir().join(format!("pippin-fifo-input-test-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let fifo = open_fifo(&path).unwrap();
@@ -601,26 +577,43 @@ mod tests {
             let (shared, control) = (shared.clone(), control.clone());
             std::thread::spawn(move || control_fifo(shared, control, fifo, fb))
         };
-        let mut opener = RecordOpener::new(&keys);
-        let mut next = || match opener.read(&mut host) {
-            Ok(Opened::Message(m)) => Some(m),
-            _ => None,
-        };
 
         let long = "x".repeat(MAX_LINE) + "key c";
         writer.write_all(format!("pointer 100 50\n{long}\n").as_bytes()).unwrap();
-        assert_eq!(next(), Some(encrypted_pointer_event(&keys.key, 0, 200, 100)));
+        assert_eq!(host.next(), Some(encrypted_pointer_event(&KEYS.key, 0, 200, 100)));
         // The backing scale changes before the click: it lands on the same point.
         *shared.display.lock() = Some(DisplaySize { points: (1280, 720), pixels: (1280, 720) });
         writer.write_all(b"click\nquit\nkey b\n").unwrap();
-        assert_eq!(next(), Some(encrypted_pointer_event(&keys.key, BTN_LEFT, 100, 50)));
-        assert_eq!(next(), Some(encrypted_pointer_event(&keys.key, 0, 100, 50)));
+        assert_eq!(host.next(), Some(encrypted_pointer_event(&KEYS.key, BTN_LEFT, 100, 50)));
+        assert_eq!(host.next(), Some(encrypted_pointer_event(&KEYS.key, 0, 100, 50)));
         // Neither the tail of the long line nor the key after quit arrives.
-        assert_eq!(next(), None);
+        assert_eq!(host.next(), None);
         assert!(matches!(events.recv().unwrap(), Event::Closed(None)));
         shared.stop.store(true, std::sync::atomic::Ordering::Release);
         reader.join().unwrap();
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The operating point and the events after `render_scale 0.5`.
+    fn half_render_scale(max_backing: Option<(u32, u32)>) -> (f64, Vec<Event>) {
+        let (shared, control, _host, events) = crate::session::tests::connected(max_backing);
+        let (fb, _fb_rx) = crossbeam_channel::unbounded();
+        run_command(&shared, &control, &fb, &mut None, Command::Set(Lever::RenderScale(0.5)));
+        (shared.op().render_scale, events.try_iter().collect())
+    }
+
+    #[test]
+    fn render_scale_asks_the_viewer_for_a_new_virtual_display() {
+        let (scale, events) = half_render_scale(Some((2560, 1440)));
+        assert_eq!(scale, 0.5);
+        assert!(matches!(events[..], [Event::Reconfigure]));
+    }
+
+    #[test]
+    fn render_scale_is_refused_on_the_macs_own_display() {
+        let (scale, events) = half_render_scale(None);
+        assert_eq!(scale, 1.0);
+        assert!(events.is_empty());
     }
 
     #[test]

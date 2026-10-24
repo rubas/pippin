@@ -1,5 +1,6 @@
 //! The viewer window: renders the remote canvas, forwards input and keeps
-//! the host's virtual display sized to the window.
+//! the host's virtual display sized to the window, or shows the Mac's own
+//! display scaled to fit.
 
 pub mod dialog;
 pub(crate) mod keymap;
@@ -48,6 +49,9 @@ pub struct Options {
     /// window's monitor.
     pub max_resolution: Option<(u32, u32)>,
     pub auto_resize: bool,
+    /// Ask the Mac for a virtual display that follows the window. `false`
+    /// streams the Mac's own display, scaled to fit the window.
+    pub virtual_display: bool,
     pub swap_ctrl_cmd: bool,
     /// Start a new session when an established one drops.
     pub reconnect: bool,
@@ -128,7 +132,7 @@ impl App {
 
     fn send_resize(&mut self) {
         let Some(s) = &self.session else { return };
-        let Some(req) = self.display_request(s.max_backing()) else { return };
+        let Some(req) = s.max_backing().and_then(|max| self.display_request(max)) else { return };
         if self.last_request != Some(req) && s.resize(req) {
             self.last_request = Some(req);
         }
@@ -234,8 +238,13 @@ impl App {
     }
 
     fn start_session(&mut self) {
-        let Some(req) = self.session_max().and_then(|max| self.display_request(max)) else { return };
-        self.last_request = Some(req);
+        let req = if self.opts.virtual_display {
+            let Some(req) = self.session_max().and_then(|max| self.display_request(max)) else { return };
+            Some(req)
+        } else {
+            None
+        };
+        self.last_request = req;
         // Process-wide, so events left queued by a previous viewer run on
         // the shared event loop can't match a new session.
         self.generation = NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

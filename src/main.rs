@@ -70,10 +70,10 @@ struct Cli {
     /// Share the console user's screen, or open a separate login session.
     #[arg(long, value_enum, default_value_t = SessionMode::Share)]
     session: SessionMode,
-    /// Initial window size in logical pixels, e.g. 1600x900. With
+    /// Initial window size in logical pixels [default: 1600x900]. With
     /// --headless, the size of the Mac display in points, e.g. 2560x1440.
-    #[arg(long, value_parser = parse_size, default_value = "1600x900")]
-    size: (u32, u32),
+    #[arg(long, value_parser = parse_size)]
+    size: Option<(u32, u32)>,
     /// Backing scale for the virtual display (1 = flat, 2 = Retina).
     /// Defaults to 2 on HiDPI screens, else 1, and to 1 with --headless.
     #[arg(long)]
@@ -106,6 +106,15 @@ struct Cli {
     /// Keep the remote resolution fixed instead of following the window.
     #[arg(long)]
     no_auto_resize: bool,
+    /// Stream the Mac's own main display instead of a virtual display for
+    /// pippin. Use it when the Mac's main display is a virtual display, as on
+    /// a Mac without a monitor: there, apps draw nowhere while pippin has its
+    /// own display. The window shows the Mac's display scaled to fit, and
+    /// never resizes it. The Mac's own screen shows the session too. --scale,
+    /// --max-resolution, --render-scale, and --size with --headless set
+    /// pippin's virtual display, so pippin refuses them with this flag.
+    #[arg(long, conflicts_with_all = ["scale", "max_resolution", "render_scale"])]
+    no_virtual_display: bool,
     /// Send Ctrl as Command and Super as Control.
     #[arg(long)]
     swap_ctrl_cmd: bool,
@@ -142,6 +151,9 @@ struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
 }
+
+/// The window size, and the Mac display of --headless, without --size.
+const DEFAULT_SIZE: (u32, u32) = (1600, 900);
 
 fn parse_size(s: &str) -> Result<(u32, u32), String> {
     let (w, h) = s.split_once(['x', 'X']).ok_or("expected WIDTHxHEIGHT")?;
@@ -189,6 +201,21 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// Refuses the options that cannot work together, beyond what clap checks.
+fn check(cli: &Cli) -> Result<()> {
+    if let Some(s) = cli.scale
+        && !(1.0..=3.0).contains(&s) {
+            bail!("--scale must be between 1 and 3");
+        }
+    if cli.render_scale != 1.0 && cli.render_scale != 0.5 {
+        bail!("--render-scale must be 1 or 0.5 (macOS only renders at whole scales)");
+    }
+    if cli.headless && cli.no_virtual_display && cli.size.is_some() {
+        bail!("--size with --headless sets pippin's virtual display, which --no-virtual-display turns off");
+    }
+    Ok(())
+}
+
 fn run(cli: Cli) -> Result<()> {
     let default_filter = match cli.verbose {
         0 => "pippin=info,wgpu=error,naga=error",
@@ -204,13 +231,7 @@ fn run(cli: Cli) -> Result<()> {
         .init();
     video::decoder::set_log_level(cli.verbose > 0);
 
-    if let Some(s) = cli.scale
-        && !(1.0..=3.0).contains(&s) {
-            bail!("--scale must be between 1 and 3");
-        }
-    if cli.render_scale != 1.0 && cli.render_scale != 0.5 {
-        bail!("--render-scale must be 1 or 0.5 (macOS only renders at whole scales)");
-    }
+    check(&cli)?;
     let store: Arc<dyn credentials::Store> = Arc::new(credentials::Keyring);
     if cli.forget_password {
         let (Some(host), Some(user)) = (&cli.host, &cli.user) else {
@@ -415,15 +436,19 @@ fn connect(
     };
     let event_loop = match viewer {
         Viewer::Window(event_loop) => event_loop,
-        Viewer::Headless => return headless::run(cfg, cli.size, cli.scale.unwrap_or(1.0)).map(|()| Outcome::Done),
+        Viewer::Headless => {
+            let display = (!cli.no_virtual_display).then(|| (cli.size.unwrap_or(DEFAULT_SIZE), cli.scale.unwrap_or(1.0)));
+            return headless::run(cfg, display).map(|()| Outcome::Done);
+        }
     };
     let opts = ui::Options {
         title: format!("{host_name} — pippin"),
         host_name: host_name.to_owned(),
-        size: cli.size,
+        size: cli.size.unwrap_or(DEFAULT_SIZE),
         scale: cli.scale,
         max_resolution: cli.max_resolution,
         auto_resize: !cli.no_auto_resize,
+        virtual_display: !cli.no_virtual_display,
         swap_ctrl_cmd: cli.swap_ctrl_cmd,
         reconnect: !cli.no_reconnect,
     };
@@ -436,5 +461,37 @@ fn connect(
             Ok(Outcome::Retry { msg, wrong_password })
         }
         r => r.map(|()| Outcome::Done),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Cli> {
+        let cli = Cli::try_parse_from([&["pippin", "mac.local", "--user", "alice"], args].concat())?;
+        check(&cli)?;
+        Ok(cli)
+    }
+
+    #[test]
+    fn no_virtual_display_refuses_the_options_of_the_virtual_display() {
+        for args in [
+            &["--render-scale", "0.5"][..],
+            &["--render-scale", "1"],
+            &["--max-resolution", "5120x2880"],
+            &["--scale", "2"],
+            &["--headless", "--size", "2560x1440"],
+        ] {
+            let e = parse(&[&["--no-virtual-display"], args].concat()).err();
+            assert!(e.is_some(), "{args:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn no_virtual_display_takes_the_window_size_and_headless() {
+        assert_eq!(parse(&["--no-virtual-display", "--size", "1280x800"]).unwrap().size, Some((1280, 800)));
+        assert!(parse(&["--no-virtual-display", "--headless", "--no-auto-resize"]).unwrap().no_virtual_display);
+        assert!(parse(&["--headless", "--size", "2560x1440", "--render-scale", "0.5"]).is_ok());
     }
 }
