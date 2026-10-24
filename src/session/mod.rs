@@ -11,7 +11,8 @@
 //!   the [`audio::Player`](crate::audio::Player) and records sender reports.
 //! * `feedback` sends RTCP (receiver reports, keyframe requests, NACKs, LTR
 //!   acks), the audio keepalive and the cursor poll on a 500 ms tick.
-//! * `clipboard` mirrors text between the local and remote pasteboards.
+//! * `clipboard` shares text and images with the host pasteboard, in the
+//!   directions that `--clipboard` allows.
 //! * `control-fifo` (debug, `PIPPIN_CONTROL_FIFO`) switches the operating
 //!   point mid-session, sends input and asks for snapshots; `stats-json`
 //!   (`--stats-json`) writes metrics.

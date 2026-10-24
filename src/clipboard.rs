@@ -71,39 +71,6 @@ impl Value {
     }
 }
 
-/// Tracks both sides by fingerprint so a value set by one side isn't echoed
-/// back to it. A value counts as synced only after its transfer succeeded.
-#[derive(Default)]
-struct Mirror {
-    /// Last local value seen.
-    local: Option<u64>,
-    /// Last value both sides hold.
-    synced: Option<u64>,
-}
-
-impl Mirror {
-    /// A local value is new to both sides.
-    fn local_is_new(&self, fp: u64) -> bool {
-        self.local != Some(fp) && self.synced != Some(fp)
-    }
-
-    /// A host value is not on the local clipboard yet.
-    fn host_is_new(&self, fp: u64) -> bool {
-        self.synced != Some(fp) || self.local != Some(fp)
-    }
-
-    /// A local value that stays local.
-    fn seen_locally(&mut self, fp: u64) {
-        self.local = Some(fp);
-    }
-
-    /// Both sides now hold the value.
-    fn synced(&mut self, fp: u64) {
-        self.local = Some(fp);
-        self.synced = Some(fp);
-    }
-}
-
 /// Re-encodes a host TIFF as PNG.
 fn tiff_to_png(tiff: &[u8]) -> anyhow::Result<Vec<u8>> {
     let img = image::load_from_memory_with_format(tiff, image::ImageFormat::Tiff)?;
@@ -193,12 +160,16 @@ impl Board for Local {
     }
 }
 
-/// Moves values between a local board and the host. A failed transfer
-/// leaves the state as it was, so the next tick tries it again.
+/// Moves values between a local board and the host. A value counts as shared
+/// only after its transfer succeeded, so a failed one runs again on the next
+/// poll.
 struct Sharing {
     mode: Mode,
-    mirror: Mirror,
-    /// The latest host value that is not on the local clipboard yet.
+    /// The fingerprint of what the local clipboard holds: the last value read
+    /// from it or written to it. A read with this fingerprint is no new copy,
+    /// so a value from one side does not go back to it.
+    local: Option<u64>,
+    /// The latest host value that failed to write to the local clipboard.
     pending: Option<Value>,
     /// The write of `pending` failed and was reported.
     reported: bool,
@@ -208,34 +179,37 @@ impl Sharing {
     /// `current` is on the local clipboard at connect time. It stays local;
     /// only later changes go to the host.
     fn new(mode: Mode, current: Option<Value>) -> Self {
-        let mut mirror = Mirror::default();
-        if let Some(v) = current {
-            mirror.seen_locally(v.fingerprint());
-        }
-        Self { mode, mirror, pending: None, reported: false }
+        Self { mode, local: current.map(|v| v.fingerprint()), pending: None, reported: false }
     }
 
-    /// The host pasteboard changed. Its latest value replaces an older one
-    /// that is still pending.
-    fn host(&mut self, content: Content) {
-        if self.mode.receives() {
-            self.pending = host_value(content).filter(|v| self.mirror.host_is_new(v.fingerprint()));
-            self.reported = false;
+    /// The host pasteboard changed. Its value is the newest copy, so it goes
+    /// to the local clipboard before the next poll reads that clipboard. It
+    /// replaces an older pending value.
+    fn host(&mut self, content: Content, board: &mut impl Board) {
+        if !self.mode.receives() {
+            return;
         }
+        self.pending = host_value(content).filter(|v| self.local != Some(v.fingerprint()));
+        self.reported = false;
+        self.write_pending(board);
     }
 
-    /// Sends a new local value to the host, then writes a pending host value
-    /// to the local board. A new local value replaces a pending host value,
-    /// because it is the newer copy.
-    fn tick(&mut self, board: &mut impl Board, send: impl FnOnce(&[u8]) -> std::io::Result<()>) {
+    /// Sends a new local copy to the host, then tries the pending host value
+    /// again. A new local copy replaces the pending value, because it is the
+    /// newer copy.
+    fn poll(&mut self, board: &mut impl Board, send: impl FnOnce(&[u8]) -> std::io::Result<()>) {
         if let Some(v) = board.read() {
             self.local(v, send);
         }
+        self.write_pending(board);
+    }
+
+    fn write_pending(&mut self, board: &mut impl Board) {
         let Some(v) = &self.pending else { return };
         match board.write(v) {
             Ok(()) => {
                 tracing::debug!("local clipboard updated from host");
-                self.mirror.synced(v.fingerprint());
+                self.local = Some(v.fingerprint());
                 self.pending = None;
             }
             Err(e) if !self.reported => {
@@ -248,32 +222,31 @@ impl Sharing {
 
     fn local(&mut self, v: Value, send: impl FnOnce(&[u8]) -> std::io::Result<()>) {
         let fp = v.fingerprint();
-        if matches!(&v, Value::Text(t) if t.is_empty()) || !self.mirror.local_is_new(fp) {
+        if matches!(&v, Value::Text(t) if t.is_empty()) || self.local == Some(fp) {
             return;
         }
         self.pending = None;
-        if !self.mode.sends() {
-            self.mirror.seen_locally(fp);
-            return;
-        }
         let msg = match &v {
+            _ if !self.mode.sends() => None,
             Value::Text(t) if t.len() > MAX_SEND => {
                 tracing::info!("local clipboard text too large to share ({} bytes)", t.len());
-                self.mirror.seen_locally(fp);
-                return;
+                None
             }
             Value::Png(p) if p.len() > MAX_SEND_IMAGE => {
                 tracing::info!("local clipboard image too large to share ({} bytes)", p.len());
-                self.mirror.seen_locally(fp);
-                return;
+                None
             }
-            Value::Text(t) => send_text(t),
-            Value::Png(p) => send_png(p),
+            Value::Text(t) => Some(send_text(t)),
+            Value::Png(p) => Some(send_png(p)),
+        };
+        let Some(msg) = msg else {
+            self.local = Some(fp);
+            return;
         };
         match send(&msg) {
             Ok(()) => {
                 tracing::debug!("sent local clipboard to host ({} bytes)", msg.len());
-                self.mirror.synced(fp);
+                self.local = Some(fp);
             }
             Err(e) => tracing::warn!("sending local clipboard to host failed ({} bytes), trying again: {e}", msg.len()),
         }
@@ -296,12 +269,14 @@ pub(crate) fn run(shared: Arc<Shared>, control: Arc<Control>, remote: Receiver<C
     let mut local = Local { clip, wayland };
     let mut sync = Sharing::new(mode, local.read());
     while !shared.is_stopped() {
+        // A poll comes only after a whole interval without a host value, so
+        // a host value written on Wayland, where the selection changes in
+        // the background, is in place before the next read.
         match remote.recv_timeout(POLL) {
-            Ok(content) => sync.host(content),
-            Err(RecvTimeoutError::Timeout) => {}
+            Ok(content) => sync.host(content, &mut local),
+            Err(RecvTimeoutError::Timeout) => sync.poll(&mut local, |msg| control.try_send(msg)),
             Err(RecvTimeoutError::Disconnected) => return,
         }
-        sync.tick(&mut local, |msg| control.try_send(msg));
     }
 }
 
@@ -346,112 +321,142 @@ mod tests {
         }
     }
 
-    /// Runs one tick and returns the texts sent to the host.
-    fn tick(sync: &mut Sharing, board: &mut Fake) -> Vec<String> {
+    /// Runs one poll and returns the texts sent to the host.
+    fn poll(sync: &mut Sharing, board: &mut Fake) -> Vec<String> {
         let mut sent = Vec::new();
-        sync.tick(board, |msg| {
+        sync.poll(board, |msg| {
             sent.push(text_from_message(msg).expect("text message"));
             Ok(())
         });
         sent
     }
 
-    /// Runs one tick whose send to the host fails.
-    fn tick_send_fails(sync: &mut Sharing, board: &mut Fake) -> usize {
+    /// Runs one poll whose send to the host fails.
+    fn poll_send_fails(sync: &mut Sharing, board: &mut Fake) -> usize {
         let mut tries = 0;
-        sync.tick(board, |_| {
+        sync.poll(board, |_| {
             tries += 1;
             Err(std::io::ErrorKind::BrokenPipe.into())
         });
         tries
     }
 
+    fn host(sync: &mut Sharing, board: &mut Fake, text: &str) {
+        sync.host(Content::Text(text.into()), board);
+    }
+
     #[test]
     fn mode_off_shares_nothing() {
         let mut board = Fake::holding("linux at connect");
         let mut sync = Sharing::new(Mode::Off, board.read());
-        sync.host(Content::Text("from mac".into()));
+        host(&mut sync, &mut board, "from mac");
+        assert_eq!(board.text(), Some("linux at connect"));
         board.value = Some(Value::Text("copied on linux".into()));
-        assert!(tick(&mut sync, &mut board).is_empty());
-        assert_eq!(board.text(), Some("copied on linux"));
+        assert!(poll(&mut sync, &mut board).is_empty());
     }
 
     #[test]
     fn mode_receive_takes_the_mac_copy_and_keeps_the_linux_copy() {
         let mut board = Fake::holding("linux at connect");
         let mut sync = Sharing::new(Mode::Receive, board.read());
-        sync.host(Content::Text("from mac".into()));
-        assert!(tick(&mut sync, &mut board).is_empty());
+        host(&mut sync, &mut board, "from mac");
         assert_eq!(board.text(), Some("from mac"));
+        assert!(poll(&mut sync, &mut board).is_empty());
         board.value = Some(Value::Text("copied on linux".into()));
-        assert!(tick(&mut sync, &mut board).is_empty());
+        assert!(poll(&mut sync, &mut board).is_empty());
     }
 
     #[test]
     fn mode_send_sends_the_linux_copy_and_ignores_the_mac_copy() {
         let mut board = Fake::holding("linux at connect");
         let mut sync = Sharing::new(Mode::Send, board.read());
-        sync.host(Content::Text("from mac".into()));
-        assert!(tick(&mut sync, &mut board).is_empty());
+        host(&mut sync, &mut board, "from mac");
         assert_eq!(board.text(), Some("linux at connect"));
+        assert!(poll(&mut sync, &mut board).is_empty());
         board.value = Some(Value::Text("copied on linux".into()));
-        assert_eq!(tick(&mut sync, &mut board), ["copied on linux"]);
+        assert_eq!(poll(&mut sync, &mut board), ["copied on linux"]);
     }
 
     #[test]
     fn mode_both_shares_each_way_without_echo() {
         let mut board = Fake::default();
         let mut sync = Sharing::new(Mode::Both, None);
-        sync.host(Content::Text("a\r\nb".into()));
-        // Our own write read back locally is not sent back.
-        assert!(tick(&mut sync, &mut board).is_empty());
+        host(&mut sync, &mut board, "a\r\nb");
         assert_eq!(board.text(), Some("a\nb"));
+        // Our own write read back locally is not sent back.
+        assert!(poll(&mut sync, &mut board).is_empty());
         board.value = Some(Value::Text("c".into()));
-        assert_eq!(tick(&mut sync, &mut board), ["c"]);
+        assert_eq!(poll(&mut sync, &mut board), ["c"]);
         // The host echoing our value back doesn't touch the local clipboard.
-        sync.host(Content::Text("c".into()));
+        board.broken = true;
+        host(&mut sync, &mut board, "c");
         assert!(sync.pending.is_none());
         // Polling the same value again sends nothing.
-        assert!(tick(&mut sync, &mut board).is_empty());
+        assert!(poll(&mut sync, &mut board).is_empty());
     }
 
     #[test]
-    fn failed_send_is_tried_again_on_the_next_tick() {
+    fn mac_copy_replaces_a_linux_copy_that_no_poll_has_read() {
+        let mut board = Fake::holding("linux at connect");
+        let mut sync = Sharing::new(Mode::Both, board.read());
+        board.value = Some(Value::Text("copied on linux".into()));
+        host(&mut sync, &mut board, "copied on the mac after it");
+        assert!(poll(&mut sync, &mut board).is_empty());
+        assert_eq!(board.text(), Some("copied on the mac after it"));
+    }
+
+    #[test]
+    fn failed_send_is_tried_again_on_the_next_poll() {
         let mut board = Fake::default();
         let mut sync = Sharing::new(Mode::Both, None);
         board.value = Some(Value::Text("copied on linux".into()));
-        assert_eq!(tick_send_fails(&mut sync, &mut board), 1);
-        assert_eq!(sync.mirror.synced, None);
-        assert_eq!(tick(&mut sync, &mut board), ["copied on linux"]);
-        assert_eq!(sync.mirror.synced, Some(fp("copied on linux")));
-        assert!(tick(&mut sync, &mut board).is_empty());
+        assert_eq!(poll_send_fails(&mut sync, &mut board), 1);
+        assert_eq!(sync.local, None);
+        assert_eq!(poll(&mut sync, &mut board), ["copied on linux"]);
+        assert_eq!(sync.local, Some(fp("copied on linux")));
+        assert!(poll(&mut sync, &mut board).is_empty());
     }
 
     #[test]
     fn failed_local_write_is_tried_again_and_does_not_send_the_old_copy() {
         let mut board = Fake { broken: true, ..Fake::holding("old linux copy") };
         let mut sync = Sharing::new(Mode::Both, board.read());
-        sync.host(Content::Text("from mac".into()));
+        host(&mut sync, &mut board, "from mac");
         // The old local value must not look like a new copy to send.
-        assert!(tick(&mut sync, &mut board).is_empty());
-        assert!(tick(&mut sync, &mut board).is_empty());
-        assert_eq!(sync.mirror.synced, None);
+        assert!(poll(&mut sync, &mut board).is_empty());
+        assert!(poll(&mut sync, &mut board).is_empty());
+        assert_eq!(sync.local, Some(fp("old linux copy")));
         board.broken = false;
-        assert!(tick(&mut sync, &mut board).is_empty());
+        assert!(poll(&mut sync, &mut board).is_empty());
         assert_eq!(board.text(), Some("from mac"));
-        assert_eq!(sync.mirror.synced, Some(fp("from mac")));
+        assert_eq!(sync.local, Some(fp("from mac")));
     }
 
     #[test]
     fn new_linux_copy_replaces_a_mac_copy_that_failed_to_write() {
         let mut board = Fake { broken: true, ..Fake::default() };
         let mut sync = Sharing::new(Mode::Both, None);
-        sync.host(Content::Text("from mac".into()));
-        assert!(tick(&mut sync, &mut board).is_empty());
-        board = Fake::holding("copied on linux");
-        assert_eq!(tick(&mut sync, &mut board), ["copied on linux"]);
+        host(&mut sync, &mut board, "from mac");
+        board.value = Some(Value::Text("copied on linux".into()));
+        assert_eq!(poll(&mut sync, &mut board), ["copied on linux"]);
         assert!(sync.pending.is_none());
         assert_eq!(board.text(), Some("copied on linux"));
+    }
+
+    #[test]
+    fn linux_copy_of_an_earlier_mac_value_replaces_a_mac_copy_that_failed_to_write() {
+        let mut board = Fake::default();
+        let mut sync = Sharing::new(Mode::Receive, None);
+        host(&mut sync, &mut board, "a");
+        board.value = Some(Value::Text("b".into()));
+        assert!(poll(&mut sync, &mut board).is_empty());
+        board.broken = true;
+        host(&mut sync, &mut board, "c");
+        board.value = Some(Value::Text("a".into()));
+        assert!(poll(&mut sync, &mut board).is_empty());
+        board.broken = false;
+        assert!(poll(&mut sync, &mut board).is_empty());
+        assert_eq!(board.text(), Some("a"));
     }
 
     #[test]
