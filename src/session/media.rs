@@ -692,6 +692,8 @@ struct DecodeLoop {
     fed_without_output: Option<u32>,
     /// No backend could be reopened; the session has been closed.
     dead: bool,
+    /// When the decoder last finished a keyframe (see [`DecodeLoop::behind`]).
+    keyframe_done: Option<Instant>,
     /// Decoded pictures of the frame being gathered, each with the arrival
     /// of its first packet, and when the frame started.
     batch: Vec<(usize, Picture, Instant)>,
@@ -850,6 +852,7 @@ impl DecodeLoop {
             stats: DecodeStats::new(),
             dump: open_dump(),
             dead: false,
+            keyframe_done: None,
         }
     }
 
@@ -957,6 +960,9 @@ impl DecodeLoop {
         let ok = self.decoder.decode(&annexb, self.pts, &mut |p| pictures.push(p));
         let slices = au.nalus.iter().filter(|n| hevc::is_slice(n)).count();
         let took = started.elapsed();
+        if irap {
+            self.keyframe_done = Some(Instant::now());
+        }
         self.stats.record(slices, pictures.len(), took);
         self.shared.metrics.decoded(took);
         if !ok {
@@ -1000,6 +1006,17 @@ impl DecodeLoop {
         }
     }
 
+    /// Whether an access unit that went into the queue at `queued` waited
+    /// past [`backlog_bound`]. Time it waited behind a keyframe does not
+    /// count: a keyframe is the slow picture that a skip asks for, and the
+    /// tiles that follow it queue behind its decode. Were they late for it,
+    /// a decoder that takes longer than the bound for a keyframe would drop
+    /// them and ask for the next keyframe forever.
+    fn behind(&self, queued: Instant, now: Instant) -> bool {
+        let since = self.keyframe_done.map_or(queued, |k| k.max(queued));
+        now.saturating_duration_since(since) > backlog_bound(self.shared.op().fps)
+    }
+
     /// The head of the queue waited past [`backlog_bound`]: drops the
     /// queue up to its newest keyframe. With none queued, it drops it all
     /// and treats that as a loss, which asks for a keyframe. A reset in the
@@ -1017,8 +1034,10 @@ impl DecodeLoop {
         }
         let skip = backlog_skip(&queued);
         let rest = queued.split_off(skip);
-        tracing::debug!("decoder behind: dropped {skip} queued access units, {} left", rest.len());
-        self.shared.metrics.backlog_skipped.fetch_add(skip as u64, Ordering::Relaxed);
+        if skip > 0 {
+            tracing::debug!("decoder behind: dropped {skip} queued access units, {} left", rest.len());
+            self.shared.metrics.backlog_skipped.fetch_add(skip as u64, Ordering::Relaxed);
+        }
         if rest.is_empty()
             && !self.awaiting_idr
             && let Some(&(tile, _)) = queued.last()
@@ -1158,7 +1177,7 @@ pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<
     while !shared.stopped() && !st.dead {
         match rx.recv_timeout(st.wait()) {
             Ok(DecoderMsg::Au { tile, au, queued }) => {
-                if queued.elapsed() > backlog_bound(shared.op().fps) {
+                if st.behind(queued, Instant::now()) {
                     st.catch_up((tile, au), &rx);
                 } else {
                     st.access_unit(tile, au);
@@ -1583,12 +1602,30 @@ mod tests {
         assert_eq!(backlog_skip(&[au(0, IDR, false), au(1, TRAIL, true)]), 2);
     }
 
-    #[test]
-    fn decoder_behind_without_a_keyframe_drops_its_queue_and_asks_for_one() {
+    /// A software decode loop at 60 fps, and the feedback it sends.
+    fn decode_loop() -> (Arc<Shared>, DecodeLoop, Receiver<Feedback>) {
         let (shared, ..) = crate::session::tests::connected(None);
         let (fb, feedback) = crossbeam_channel::unbounded();
         let opts = DecoderOptions { kind: decoder::DecoderKind::Software, threads: 1, vaapi_device: None };
-        let mut st = DecodeLoop::new(shared.clone(), opts.clone(), fb, Decoder::new(&opts).unwrap(), false);
+        let st = DecodeLoop::new(shared.clone(), opts.clone(), fb, Decoder::new(&opts).unwrap(), false);
+        (shared, st, feedback)
+    }
+
+    #[test]
+    fn time_behind_a_keyframe_decode_is_not_backlog() {
+        let (_, mut st, _) = decode_loop();
+        let now = Instant::now();
+        let queued = now - Duration::from_millis(80);
+        assert!(st.behind(queued, now));
+        // A keyframe took until 30 ms ago: only the time after it counts.
+        st.keyframe_done = Some(now - Duration::from_millis(30));
+        assert!(!st.behind(queued, now));
+        assert!(st.behind(queued, now + Duration::from_millis(30)));
+    }
+
+    #[test]
+    fn decoder_behind_without_a_keyframe_drops_its_queue_and_asks_for_one() {
+        let (shared, mut st, feedback) = decode_loop();
         // Mid-stream: the decoder has had its keyframe.
         st.awaiting_idr = false;
         let (tx, rx) = crossbeam_channel::unbounded();
