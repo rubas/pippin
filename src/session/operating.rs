@@ -363,10 +363,7 @@ fn run_command(shared: &Shared, control: &Control, fb: &Sender<Feedback>, pointe
 pub(super) fn open_fifo(path: &Path) -> std::io::Result<std::fs::File> {
     let name = path.file_name().ok_or_else(|| Error::new(ErrorKind::InvalidInput, "the path has no file name"))?;
     let name = CString::new(name.as_encoded_bytes()).map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
-    let dir_path = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
+    let dir_path = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     // The FIFO is created and opened relative to this descriptor, so the
     // checks hold for the directory that was checked.
     let dir = std::fs::File::open(dir_path)?;
