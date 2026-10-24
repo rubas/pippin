@@ -522,9 +522,10 @@ impl Decoder {
                     if p.is_null() { "unknown".into() } else { CStr::from_ptr(p).to_string_lossy() }
                 };
                 tracing::info!(
-                    "stream colour: range {}, matrix {}; converting as {colour:?}",
-                    name(ffi::av_color_range_name(range)),
-                    name(ffi::av_color_space_name(space)),
+                    range = %name(ffi::av_color_range_name(range)),
+                    matrix = %name(ffi::av_color_space_name(space)),
+                    ?colour,
+                    "stream colour",
                 );
             }
             colour
