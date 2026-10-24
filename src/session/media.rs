@@ -1102,44 +1102,45 @@ struct StallRecovery {
 /// stalled one.
 #[derive(Default)]
 struct StallWatch {
-    /// Per SSRC with packets flowing: when the watch first saw it flow. A
-    /// tile that wakes from a still screen has an old picture, so its
-    /// stall counts from here, not from that picture.
+    /// Per SSRC with packets flowing, or with last packets that brought no
+    /// picture: when the watch first saw it flow. A tile that wakes from a
+    /// still screen has an old picture, so its stall counts from here, not
+    /// from that picture.
     flowing_since: HashMap<u32, u64>,
     last_keyframe_ms: Option<u64>,
-    reset_done: bool,
+    /// A decoder reset covers every stall that began before it.
+    last_reset_ms: Option<u64>,
 }
 
 impl StallWatch {
     fn check(&mut self, now_ms: u64, tiles: &[TileProgress]) -> StallRecovery {
         let mut flowing_since = HashMap::new();
+        let mut r = StallRecovery::default();
         let mut stalled = Vec::new();
-        let mut worst = 0;
         for (tile, t) in tiles.iter().enumerate() {
-            if t.packet_ms == 0 || now_ms.saturating_sub(t.packet_ms) >= IDLE_AFTER_MS {
-                continue;
-            }
-            let since = self.flowing_since.get(&t.ssrc).copied().unwrap_or(now_ms);
+            let flowing = t.packet_ms != 0 && now_ms.saturating_sub(t.packet_ms) < IDLE_AFTER_MS;
+            // A tile that goes quiet after packets without a picture stays
+            // stalled, so a slow trickle of packets cannot restart its count.
+            let since = match self.flowing_since.get(&t.ssrc) {
+                Some(&since) if flowing || t.picture_ms < t.packet_ms => since,
+                None if flowing => now_ms,
+                _ => continue,
+            };
             flowing_since.insert(t.ssrc, since);
-            let stall = now_ms.saturating_sub(since.max(t.picture_ms));
-            if stall >= STALL_KEYFRAME_MS {
+            let start = since.max(t.picture_ms);
+            let stall = now_ms.saturating_sub(start);
+            if flowing && stall >= STALL_KEYFRAME_MS {
                 stalled.push(tile);
-                worst = worst.max(stall);
+                r.reset |= stall > STALL_RESET_MS && self.last_reset_ms.is_none_or(|reset| start > reset);
             }
         }
         self.flowing_since = flowing_since;
-        if stalled.is_empty() {
-            self.reset_done = false;
-            return StallRecovery::default();
+        if r.reset {
+            self.last_reset_ms = Some(now_ms);
         }
-        let mut r = StallRecovery::default();
-        if self.last_keyframe_ms.is_none_or(|t| now_ms.saturating_sub(t) >= STALL_KEYFRAME_EVERY_MS) {
+        if !stalled.is_empty() && self.last_keyframe_ms.is_none_or(|t| now_ms.saturating_sub(t) >= STALL_KEYFRAME_EVERY_MS) {
             self.last_keyframe_ms = Some(now_ms);
             r.keyframes = stalled;
-        }
-        if worst > STALL_RESET_MS && !self.reset_done {
-            self.reset_done = true;
-            r.reset = true;
         }
         r
     }
@@ -1601,5 +1602,40 @@ mod tests {
         assert_eq!(w.check(12_500, &flowing(12_500, [12_400; 4])), keyframes(&[]));
         let again: Vec<u64> = (26..=60).map(|i| i * 500).filter(|&now| w.check(now, &flowing(now, [12_400, now, now, now])).reset).collect();
         assert_eq!(again, [20_500]);
+    }
+
+    #[test]
+    fn tile_with_a_picture_every_two_seconds_still_gets_its_lost_keyframe() {
+        let mut w = StallWatch::default();
+        // The decoder lost the keyframe after the picture at 900 ms. The
+        // host then sends one changed picture every 2 s, from 1 s on.
+        let tile = |now: u64| [TileProgress { ssrc: 10, packet_ms: now - (now - 1_000) % 2_000, picture_ms: 900 }];
+        let (mut keyframe_at, mut reset_at) = (Vec::new(), Vec::new());
+        for now in (2..=20).map(|i| i * 500) {
+            let r = w.check(now, &tile(now));
+            if !r.keyframes.is_empty() {
+                keyframe_at.push(now);
+            }
+            if r.reset {
+                reset_at.push(now);
+            }
+        }
+        // Requests go out only while its packets flow.
+        assert_eq!(keyframe_at, [4_000, 5_500, 7_000, 9_000]);
+        assert_eq!(reset_at, [9_500]);
+    }
+
+    #[test]
+    fn stall_that_begins_after_a_reset_gets_its_own_reset() {
+        let mut w = StallWatch::default();
+        // Tile 0 stalls from 1 s to 14 s. Tile 1 stalls from 10 s on, while
+        // tile 0 is still stalled.
+        let pictures = |now: u64| {
+            let tile_0 = if now < 14_000 { 1_000 } else { now - 100 };
+            let tile_1 = if now < 10_000 { now - 100 } else { 10_000 };
+            [tile_0, tile_1, now - 100, now - 100]
+        };
+        let resets: Vec<u64> = (2..=44).map(|i| i * 500).filter(|&now| w.check(now, &flowing(now, pictures(now))).reset).collect();
+        assert_eq!(resets, [9_500, 18_500]);
     }
 }
