@@ -26,8 +26,15 @@ impl Canvas {
         }
     }
 
+    /// Keeps the newest picture of each tile. All tiles have one size: a
+    /// picture of another size starts a new layout and drops the tiles of
+    /// the old one, so a snapshot never mixes the two.
     pub fn put(&mut self, pictures: Vec<(usize, Picture)>) {
         for (tile, pic) in pictures.into_iter().filter(|(_, p)| p.width > 0 && p.height > 0) {
+            let size = |p: &Picture| (p.width, p.height);
+            if self.tiles.iter().flatten().any(|held| size(held) != size(&pic)) {
+                self.tiles.clear();
+            }
             if self.tiles.len() <= tile {
                 self.tiles.resize_with(tile + 1, || None);
             }
@@ -136,6 +143,27 @@ mod tests {
             assert_eq!(back.get_pixel(x, 1).0, [255, 0, 0]);
             assert_eq!(back.get_pixel(x, 2).0, [0, 0, 255]);
         }
+    }
+
+    #[test]
+    fn a_snapshot_never_mixes_tiles_of_two_sizes() {
+        let mut canvas = Canvas::default();
+        canvas.resize(4, 4);
+        // A late tile 0 of the old 4×4 layout, then tile 1 of the new 4×2 one.
+        canvas.put(vec![(0, Picture::filled(4, 4, BLUE))]);
+        canvas.put(vec![(1, Picture::filled(4, 2, RED))]);
+        assert!(canvas.image().is_none(), "tile 0 of the new layout is still missing");
+        canvas.put(vec![(0, Picture::filled(4, 2, RED))]);
+        let img = canvas.image().unwrap();
+        assert_eq!(img.dimensions(), (4, 4));
+        assert!(img.pixels().all(|p| p.0 == [255, 0, 0]));
+    }
+
+    #[test]
+    fn a_failed_write_leaves_no_file() {
+        let path = std::env::temp_dir().join(format!("pippin-no-such-dir-{}", std::process::id())).join("a.png");
+        assert!(write_png(&RgbImage::new(2, 2), &path).is_err());
+        assert!(!path.exists());
     }
 
     #[test]

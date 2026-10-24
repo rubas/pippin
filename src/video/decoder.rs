@@ -109,6 +109,26 @@ impl Picture {
     }
 }
 
+#[cfg(test)]
+impl Picture {
+    /// A planar 4:2:0 picture of one colour, for tests without a decoder.
+    pub fn filled(width: u32, height: u32, yuv: [u8; 3]) -> Self {
+        let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+        unsafe {
+            let f = ffi::av_frame_alloc();
+            (*f).format = PixFmt::AV_PIX_FMT_YUV420P;
+            (*f).width = width as i32;
+            (*f).height = height as i32;
+            assert_eq!(ffi::av_frame_get_buffer(f, 0), 0);
+            for (i, (v, rows)) in yuv.into_iter().zip([height, ch, ch]).enumerate() {
+                ptr::write_bytes((*f).data[i], v, (*f).linesize[i] as usize * rows as usize);
+            }
+            let frame = FrameRef(f);
+            Picture { pts: 0, width, height, chroma_width: cw, chroma_height: ch, layout: Layout::Planar, frame, damaged: false }
+        }
+    }
+}
+
 /// Which decoder to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum DecoderKind {
