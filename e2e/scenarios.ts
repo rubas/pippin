@@ -202,21 +202,36 @@ function fullscreen(vdisplay: boolean, macDisplay = false): Scenario {
   };
 }
 
-const SCROLL_APP = "/tmp/scrolllog.app";
-const SCROLL_LOG = "/tmp/scrolllog.log";
-const SCROLL_PLIST = `<?xml version="1.0" encoding="UTF-8"?>
+/**
+ * Opens the guest tool `name` (e2e/guest/<name>.swift) as an app in the login
+ * session, with its log file and `args`, and waits until it logs `ready`.
+ * Returns a reader of the lines of its log, which also goes to the output
+ * folder at the end.
+ */
+async function openTool(ctx: Context, name: string, args: string[] = []): Promise<() => Promise<string[]>> {
+  const app = `/tmp/${name}.app`;
+  const log = `/tmp/${name}.log`;
+  const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict>
-<key>CFBundleExecutable</key><string>scrolllog</string>
-<key>CFBundleIdentifier</key><string>dev.rubas.scrolllog</string>
+<key>CFBundleExecutable</key><string>${name}</string>
+<key>CFBundleIdentifier</key><string>dev.rubas.${name}</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 </dict></plist>
 `;
+  await ctx.guest.sh(`mkdir -p ${app}/Contents/MacOS && : >${log}`);
+  await ctx.guest.put(`${app}/Contents/Info.plist`, plist);
+  await ctx.guest.put(`${app}/Contents/MacOS/${name}`, await swiftTool(name), "755");
+  await ctx.guest.sh(`open -n ${app} --args ${[log, ...args].join(" ")}`);
+  const read = async () => (await ctx.guest.sh(`cat ${log}`)).split("\n").filter(Boolean);
+  ctx.onTeardown(async () => Bun.write(`${ctx.out}/${name}.log`, await ctx.guest.sh(`cat ${log}`)));
+  await waitFor(`${name} to show its window`, 20_000, async () => (await read()).includes("ready") || undefined);
+  return read;
+}
 
 /** A scroll event that reached scrolllog, with the sign of the device: a positive x is left, a positive y up. */
 type Scrolled = { x: number; y: number };
 
-async function scrolled(ctx: Context): Promise<Scrolled[]> {
-  const lines = (await ctx.guest.sh(`cat ${SCROLL_LOG}`)).split("\n");
+function scrolled(lines: string[]): Scrolled[] {
   return lines
     .filter((l) => l.startsWith("scroll "))
     .map((l) => {
@@ -230,22 +245,15 @@ const scroll: Scenario = {
   async run(ctx) {
     await connected(ctx, ["WindowServer", "screensharingd"], false, async (session) => {
       // After the connect, so that the window covers pippin's display.
-      await ctx.guest.sh(`mkdir -p ${SCROLL_APP}/Contents/MacOS && : >${SCROLL_LOG}`);
-      await ctx.guest.put(`${SCROLL_APP}/Contents/Info.plist`, SCROLL_PLIST);
-      await ctx.guest.put(`${SCROLL_APP}/Contents/MacOS/scrolllog`, await swiftTool("scrolllog"), "755");
-      await ctx.guest.sh(`open -n ${SCROLL_APP} --args ${SCROLL_LOG}`);
-      ctx.onTeardown(async () => Bun.write(`${ctx.out}/scrolllog.log`, await ctx.guest.sh(`cat ${SCROLL_LOG}`)));
-      await waitFor("scrolllog to show its window", 20_000, async () =>
-        (await ctx.guest.sh(`cat ${SCROLL_LOG}`)).includes("ready") || undefined,
-      );
+      const log = await openTool(ctx, "scrolllog");
       session.send("pointer 200 200");
       await Bun.sleep(1000);
       session.send("scroll 0 3");
       await Bun.sleep(2000);
-      const vertical = await scrolled(ctx);
+      const vertical = scrolled(await log());
       session.send("scroll 2 0");
       await Bun.sleep(2000);
-      const horizontal = (await scrolled(ctx)).slice(vertical.length);
+      const horizontal = scrolled(await log()).slice(vertical.length);
       await session.snapshot("1-scrolllog");
       const show = (events: Scrolled[]) => events.map((e) => `${e.x},${e.y}`).join(" ") || "none";
       // AppKit can merge scroll events, so the count of events is not the count of steps.
@@ -256,9 +264,47 @@ const scroll: Scenario = {
   },
 };
 
+const SWISS_GERMAN = "com.apple.keylayout.SwissGerman";
+// What pippin sends for the Swiss German layout on Linux: AltGr characters,
+// the text of dead keys, and umlauts. Each lone accent stands before a letter
+// that it could take, so the text shows when the Mac starts a dead key of
+// its own instead of typing the accent.
+const SWISS_TEXT = "@#|\\[]{}~ ^e `a ´e ¨u ~n êàéèñ äöü ÄÖÜ ç€§°";
+
+const keyboard: Scenario = {
+  about: "type Swiss German text and press Command and Option, and see each reach a text view on a Mac with the Swiss German layout",
+  async run(ctx) {
+    await connected(ctx, ["WindowServer", "screensharingd", "ScreensharingAgent"], false, async (session) => {
+      const log = await openTool(ctx, "keylog", [SWISS_GERMAN]);
+      const source = (await log()).find((l) => l.startsWith("source "));
+      ctx.check("input source", source === `source ${SWISS_GERMAN}`, source ?? "none");
+      session.send("pointer 200 200");
+      session.send("click");
+      await Bun.sleep(1000);
+      session.send(`type ${SWISS_TEXT}`);
+      await Bun.sleep(3000);
+      const last = (await log()).findLast((l) => l.startsWith("text "));
+      const text = last ? (JSON.parse(last.slice(5)) as string) : undefined;
+      ctx.check("swiss german text", text === SWISS_TEXT, `typed ${JSON.stringify(text ?? null)}`);
+      const flags = async (combo: string) => {
+        const before = (await log()).length;
+        session.send(`key ${combo}`);
+        await Bun.sleep(1000);
+        return (await log()).slice(before).filter((l) => l.startsWith("flags "));
+      };
+      for (const [combo, held] of [["opt", "option"], ["cmd", "command"]] as const) {
+        const got = await flags(combo);
+        ctx.check(`${combo} key`, got[0] === `flags ${held}`, got.join(", ") || "no modifier change");
+      }
+      await session.snapshot("1-keylog");
+    });
+  },
+};
+
 export const SCENARIOS: Record<string, Scenario> = {
   smoke,
   scroll,
+  keyboard,
   fullscreen: fullscreen(true),
   "fullscreen-no-vdisplay": fullscreen(false),
   "fullscreen-own-display": fullscreen(true, true),
