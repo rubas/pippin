@@ -1298,8 +1298,10 @@ impl FeedbackSender {
     /// Packets arriving for a tile but no pictures coming out means the
     /// decoder is stuck waiting for a keyframe that was lost, or wedged.
     fn check_stall(&mut self, dec: &Sender<DecoderMsg>) {
-        let ssrcs = self.shared.tile_ssrcs.lock().clone();
-        let tiles: Vec<TileProgress> = ssrcs
+        let tiles: Vec<TileProgress> = self
+            .shared
+            .tile_ssrcs
+            .lock()
             .iter()
             .enumerate()
             .map(|(tile, &ssrc)| {
@@ -1309,7 +1311,7 @@ impl FeedbackSender {
             .collect();
         let r = self.stall.check(self.shared.clock.now_ms(), &tiles);
         if !r.keyframes.is_empty() {
-            tracing::debug!("no picture on tiles {:?}; requesting keyframes", r.keyframes);
+            tracing::debug!(tiles = ?r.keyframes, "no picture on tiles; requesting keyframes");
         }
         for tile in r.keyframes {
             self.keyframe(Some(tile), KeyframeCause::Stall);
