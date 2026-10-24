@@ -1,7 +1,7 @@
 //! UDP media threads: SRTP video receive, HEVC decode and RTCP feedback.
 
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::sync::Arc;
@@ -655,12 +655,15 @@ fn is_keyframe(au: &AccessUnit) -> bool {
     au.complete && au.nalus.iter().any(|n| hevc::is_irap(n))
 }
 
+/// An access unit in the decoder queue: its tile, and when it went in.
+type Queued = (usize, AccessUnit, Instant);
+
 /// How many of the `queued` access units the decoder drops when the head
 /// waited past [`backlog_bound`]: those before the newest keyframe, or all
 /// of them when none is queued, as every other picture needs the ones
 /// before it.
-fn backlog_skip(queued: &[(usize, AccessUnit)]) -> usize {
-    queued.iter().rposition(|(_, au)| is_keyframe(au)).unwrap_or(queued.len())
+fn backlog_skip(queued: &[Queued]) -> usize {
+    queued.iter().rposition(|(_, au, _)| is_keyframe(au)).unwrap_or(queued.len())
 }
 
 struct DecodeLoop {
@@ -694,6 +697,9 @@ struct DecodeLoop {
     dead: bool,
     /// When the decoder last finished a keyframe (see [`DecodeLoop::behind`]).
     keyframe_done: Option<Instant>,
+    /// What [`DecodeLoop::catch_up`] kept of the queue after the keyframe
+    /// it decoded. It goes before the queue, one access unit at a time.
+    pending: VecDeque<Queued>,
     /// Decoded pictures of the frame being gathered, each with the arrival
     /// of its first packet, and when the frame started.
     batch: Vec<(usize, Picture, Instant)>,
@@ -853,6 +859,7 @@ impl DecodeLoop {
             dump: open_dump(),
             dead: false,
             keyframe_done: None,
+            pending: VecDeque::new(),
         }
     }
 
@@ -1018,15 +1025,20 @@ impl DecodeLoop {
     }
 
     /// The head of the queue waited past [`backlog_bound`]: drops the
-    /// queue up to its newest keyframe. With none queued, it drops it all
-    /// and treats that as a loss, which asks for a keyframe. A reset in the
+    /// queue up to its newest keyframe and decodes that keyframe. What
+    /// follows it goes to [`DecodeLoop::pending`], so the main loop checks
+    /// each one again. With no keyframe queued, it drops the queue and
+    /// treats that as a loss, which asks for a keyframe. A reset in the
     /// queue is done in its place, and drops what came before it.
-    fn catch_up(&mut self, head: (usize, AccessUnit), rx: &Receiver<DecoderMsg>) {
-        let mut queued = vec![head];
+    fn catch_up(&mut self, head: Queued, rx: &Receiver<DecoderMsg>) {
+        let mut queued: Vec<Queued> = vec![head];
+        queued.extend(self.pending.drain(..));
+        let mut dropped = 0;
         while let Ok(msg) = rx.try_recv() {
             match msg {
-                DecoderMsg::Au { tile, au, .. } => queued.push((tile, au)),
+                DecoderMsg::Au { tile, au, queued: at } => queued.push((tile, au, at)),
                 DecoderMsg::Reset(why) => {
+                    dropped += queued.len();
                     self.absorb_params(queued.drain(..));
                     self.reset(why);
                 }
@@ -1034,13 +1046,14 @@ impl DecodeLoop {
         }
         let skip = backlog_skip(&queued);
         let rest = queued.split_off(skip);
-        if skip > 0 {
-            tracing::debug!("decoder behind: dropped {skip} queued access units, {} left", rest.len());
-            self.shared.metrics.backlog_skipped.fetch_add(skip as u64, Ordering::Relaxed);
+        dropped += skip;
+        if dropped > 0 {
+            tracing::debug!(dropped, left = rest.len(), "decoder behind: dropped queued access units");
+            self.shared.metrics.backlog_skipped.fetch_add(dropped as u64, Ordering::Relaxed);
         }
         if rest.is_empty()
             && !self.awaiting_idr
-            && let Some(&(tile, _)) = queued.last()
+            && let Some(&(tile, ..)) = queued.last()
         {
             if self.shared.op().after_loss == AfterLoss::Conceal {
                 self.lossy = true;
@@ -1050,14 +1063,16 @@ impl DecodeLoop {
             self.loss_keyframe(tile, self.epoch, KeyframeCause::Backlog);
         }
         self.absorb_params(queued);
-        for (tile, au) in rest {
+        let mut rest = rest.into_iter();
+        if let Some((tile, au, _)) = rest.next() {
             self.access_unit(tile, au);
         }
+        self.pending.extend(rest);
     }
 
     /// Keeps the parameter sets of access units that are not decoded.
-    fn absorb_params(&mut self, aus: impl IntoIterator<Item = (usize, AccessUnit)>) {
-        for (_, au) in aus {
+    fn absorb_params(&mut self, aus: impl IntoIterator<Item = Queued>) {
+        for (_, au, _) in aus {
             for nal in au.nalus.iter().filter(|n| hevc::is_param_set(n)) {
                 self.params.absorb(nal);
             }
@@ -1175,10 +1190,14 @@ pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<
     shared.metrics.set_decoder(decoder.backend().name());
     let mut st = DecodeLoop::new(shared.clone(), opts, fb, decoder, sync_tiles);
     while !shared.stopped() && !st.dead {
-        match rx.recv_timeout(st.wait()) {
+        let msg = match st.pending.pop_front() {
+            Some((tile, au, queued)) => Ok(DecoderMsg::Au { tile, au, queued }),
+            None => rx.recv_timeout(st.wait()),
+        };
+        match msg {
             Ok(DecoderMsg::Au { tile, au, queued }) => {
                 if st.behind(queued, Instant::now()) {
-                    st.catch_up((tile, au), &rx);
+                    st.catch_up((tile, au, queued), &rx);
                 } else {
                     st.access_unit(tile, au);
                 }
@@ -1578,10 +1597,18 @@ mod tests {
     const TRAIL: u8 = 1;
     const IDR: u8 = 19;
 
-    /// An access unit of tile `tile` with one NAL unit of type `nal`.
-    fn au(tile: usize, nal: u8, complete: bool) -> (usize, AccessUnit) {
+    /// An access unit of tile `tile` with one NAL unit of type `nal`,
+    /// queued 80 ms ago: past the bound at 60 fps.
+    fn au(tile: usize, nal: u8, complete: bool) -> Queued {
         let nalus = vec![vec![nal << 1, 1, 0xaf]];
-        (tile, AccessUnit { ssrc: tile as u32, nalus, donl: None, complete, recovered: false, received: Instant::now() })
+        let au = AccessUnit { ssrc: tile as u32, nalus, donl: None, complete, recovered: false, received: Instant::now() };
+        (tile, au, Instant::now() - Duration::from_millis(80))
+    }
+
+    fn send(tx: &Sender<DecoderMsg>, aus: impl IntoIterator<Item = Queued>) {
+        for (tile, au, queued) in aus {
+            tx.send(DecoderMsg::Au { tile, au, queued }).unwrap();
+        }
     }
 
     #[test]
@@ -1629,16 +1656,38 @@ mod tests {
         // Mid-stream: the decoder has had its keyframe.
         st.awaiting_idr = false;
         let (tx, rx) = crossbeam_channel::unbounded();
-        let queued = Instant::now() - Duration::from_millis(80);
-        for (tile, au) in [au(1, TRAIL, true), au(2, TRAIL, true), au(3, TRAIL, true)] {
-            tx.send(DecoderMsg::Au { tile, au, queued }).unwrap();
-        }
+        send(&tx, [au(1, TRAIL, true), au(2, TRAIL, true), au(3, TRAIL, true)]);
         st.catch_up(au(0, TRAIL, true), &rx);
         assert!(rx.is_empty());
+        assert!(st.pending.is_empty());
         assert_eq!(shared.metrics.backlog_skipped.load(Ordering::Relaxed), 4);
         assert!(st.awaiting_idr);
         assert!(matches!(feedback.try_recv(), Ok(Feedback::Keyframe(Some(3), KeyframeCause::Backlog))));
         assert!(feedback.try_recv().is_err());
+    }
+
+    #[test]
+    fn decoder_behind_decodes_the_newest_keyframe_and_checks_the_rest_again() {
+        let (shared, mut st, _) = decode_loop();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        send(&tx, [au(0, IDR, true), au(1, TRAIL, true), au(2, TRAIL, true)]);
+        st.catch_up(au(0, TRAIL, true), &rx);
+        assert_eq!(shared.metrics.backlog_skipped.load(Ordering::Relaxed), 1);
+        // The tiles after the keyframe wait in their order for the main
+        // loop, which checks each one against the bound.
+        let tiles: Vec<usize> = st.pending.iter().map(|(t, ..)| *t).collect();
+        assert_eq!(tiles, [1, 2]);
+    }
+
+    #[test]
+    fn access_units_before_a_queued_reset_count_as_skipped() {
+        let (shared, mut st, _) = decode_loop();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        send(&tx, [au(1, TRAIL, true)]);
+        tx.send(DecoderMsg::Reset(ResetWhy::Stall)).unwrap();
+        send(&tx, [au(0, IDR, true)]);
+        st.catch_up(au(0, TRAIL, true), &rx);
+        assert_eq!(shared.metrics.backlog_skipped.load(Ordering::Relaxed), 2);
     }
 
     #[test]
