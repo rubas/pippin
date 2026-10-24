@@ -145,29 +145,46 @@ pub trait EventSink: Send + Sync + 'static {
 /// Latest decoded picture per tile, handed from the decoder to the renderer.
 #[derive(Default)]
 pub struct FrameStore {
-    slots: Mutex<Vec<Option<Picture>>>,
+    /// Each picture with the arrival of its first packet.
+    slots: Mutex<Vec<Option<(Picture, Instant)>>>,
     notified: AtomicBool,
+    /// First packet arrivals of the pictures taken since the last present.
+    taken: Mutex<Vec<Instant>>,
 }
 
 impl FrameStore {
     /// Publishes one host frame's pictures together, so the renderer never
     /// shows some tiles from one frame and some from the previous (tearing).
-    fn put_frame(&self, pics: impl IntoIterator<Item = (usize, Picture)>) -> bool {
+    fn put_frame(&self, pics: impl IntoIterator<Item = (usize, Picture, Instant)>) -> bool {
         let mut slots = self.slots.lock();
-        for (tile, pic) in pics {
+        for (tile, pic, received) in pics {
             if slots.len() <= tile {
                 slots.resize_with(tile + 1, || None);
             }
-            slots[tile] = Some(pic);
+            slots[tile] = Some((pic, received));
         }
         !self.notified.swap(true, Ordering::AcqRel)
     }
 
-    /// Takes every pending picture as `(tile, picture)`.
+    /// Takes every pending picture as `(tile, picture)`. A picture that a
+    /// newer one of its tile replaced before this call is never shown.
     pub fn take(&self) -> Vec<(usize, Picture)> {
         self.notified.store(false, Ordering::Release);
         let mut slots = self.slots.lock();
-        slots.iter_mut().enumerate().filter_map(|(i, s)| s.take().map(|p| (i, p))).collect()
+        let mut taken = self.taken.lock();
+        let mut pictures = Vec::new();
+        for (tile, slot) in slots.iter_mut().enumerate() {
+            if let Some((pic, received)) = slot.take() {
+                metrics::push_sample(&mut taken, received);
+                pictures.push((tile, pic));
+            }
+        }
+        pictures
+    }
+
+    /// The first packet arrivals of the pictures taken since the last call.
+    fn take_presented(&self) -> Vec<Instant> {
+        std::mem::take(&mut self.taken.lock())
     }
 }
 
@@ -407,6 +424,16 @@ impl Session {
 
     pub fn frames(&self) -> &FrameStore {
         &self.shared.frames
+    }
+
+    /// The pictures taken from [`frames`](Self::frames) are on screen now:
+    /// the viewer presented them, or `--headless` keeps them. Their latency
+    /// goes into `--stats-json`.
+    pub fn presented(&self) {
+        let now = Instant::now();
+        for received in self.shared.frames.take_presented() {
+            self.shared.metrics.presented_after(now.saturating_duration_since(received));
+        }
     }
 
     fn control(&self) -> Option<&Arc<Control>> {
@@ -857,5 +884,21 @@ pub(super) mod tests {
         let (stream, _) = listener.accept().unwrap();
         stream.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
         (client, Host { stream, opener: RecordOpener::new(&KEYS) })
+    }
+
+    #[test]
+    fn present_latency_counts_only_the_pictures_the_renderer_took() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let grey = || Picture::filled(16, 8, [128, 128, 128]);
+        let store = FrameStore::default();
+        // Tile 1 gets a second picture before the renderer takes the first,
+        // so the first is never on screen.
+        assert!(store.put_frame([(1, grey(), ms(0))]));
+        assert!(!store.put_frame([(1, grey(), ms(16)), (0, grey(), ms(17))]));
+        let tiles: Vec<usize> = store.take().into_iter().map(|(t, _)| t).collect();
+        assert_eq!(tiles, [0, 1]);
+        assert_eq!(store.take_presented(), [ms(17), ms(16)]);
+        assert!(store.take_presented().is_empty());
     }
 }
