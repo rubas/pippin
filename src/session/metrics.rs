@@ -47,7 +47,8 @@
 //!   caused by loss only: `kf_loss_fir`, `kf_loss_pli`, `kf_loss_fir_pli`.
 //!   By cause, all of them: `kf_gap` (an access unit came out incomplete),
 //!   `kf_decode` (the decoder rejected one), `kf_damaged` (a picture decoded
-//!   with missing references) are the loss causes; `kf_adoption` (a new
+//!   with missing references), `kf_backlog` (the decoder fell behind and
+//!   dropped its queue) are the loss causes; `kf_adoption` (a new
 //!   SSRC group), `kf_reoffer` (resize or operating point change),
 //!   `kf_stall` (packets but no pictures; repeated every 1.5 s),
 //!   `kf_hw_fallback` (switched decoder backend) and `kf_other` (a keyframe
@@ -61,7 +62,7 @@
 //!   IRAP (the host's IDR covers the base tile only; the rest follow).
 //! * `recovery_n`, `recovery_p50_ms`, `recovery_max_ms`: outages caused by
 //!   loss and how long they lasted. An outage starts at the first loss the
-//!   decoder sees (gap, decode, damaged) while none is open, whether or not
+//!   decoder sees (gap, decode, damaged, backlog) while none is open, whether or not
 //!   its keyframe request went out (it may be rate-limited); later losses
 //!   during it add nothing. A gap is seen when the hold gives up, so the
 //!   hold's wait comes before the outage: it shows in `frozen_ms`, not
@@ -87,7 +88,10 @@
 //!   during which the latest picture shown was such a picture and video
 //!   arrived in the last 1.5 s.
 //! * `decode_aus`, `decode_avg_ms`, `decode_worst_ms`: access units fed to
-//!   the decoder and how long the decode call took.
+//!   the decoder and how long the decode call took. `backlog_skipped_aus`:
+//!   access units the decoder dropped without decoding them, because the
+//!   queue in front of it held pictures older than three frame intervals
+//!   (`backlog_bound` in `media.rs`).
 //! * `presented_fps`: frames handed to the renderer (a frame is one tile
 //!   picture, or one gathered set with `--sync-tiles`). The display may
 //!   still drop some.
@@ -153,6 +157,7 @@ pub(super) struct Metrics {
     pub decoded_aus: AtomicU64,
     pub decode_ns: AtomicU64,
     pub decode_worst_ns: AtomicU64,
+    pub backlog_skipped: AtomicU64,
     pub presented: AtomicU64,
     /// From the first packet of a picture to the decoder output, and to the
     /// present.
@@ -510,11 +515,12 @@ fn line(m: &Metrics, cx: &LineContext) -> String {
     let avg = if aus == 0 { "null".into() } else { ms(busy / aus as u32) };
     let _ = write!(
         s,
-        ",\"frozen_ms\":{},\"concealed_ms\":{},\"concealed_pictures\":{},\"decode_aus\":{aus},\"decode_avg_ms\":{avg},\"decode_worst_ms\":{},\"presented_fps\":{}",
+        ",\"frozen_ms\":{},\"concealed_ms\":{},\"concealed_pictures\":{},\"decode_aus\":{aus},\"decode_avg_ms\":{avg},\"decode_worst_ms\":{},\"backlog_skipped_aus\":{},\"presented_fps\":{}",
         cx.frozen_ms,
         cx.concealed_ms,
         take(&m.concealed_pictures),
         if aus == 0 { "null".into() } else { ms(worst) },
+        take(&m.backlog_skipped),
         rate(take(&m.presented)),
     );
     p50_max(&mut s, "latency_decode", &m.decode_latency);
@@ -781,10 +787,10 @@ mod tests {
              \"nack_retries\":0,\"nacked_arrived\":2,\"nack_arrival_p50_ms\":30.0,\"nack_arrival_max_ms\":30.0,\
              \"holds_started\":0,\"holds_filled\":0,\"holds_given_up\":0,\"kf_loss_fir\":0,\"kf_loss_pli\":1,\
              \"kf_loss_fir_pli\":0,\"kf_gap\":1,\"kf_decode\":0,\"kf_damaged\":0,\"kf_adoption\":0,\
-             \"kf_reoffer\":0,\"kf_stall\":0,\"kf_hw_fallback\":0,\"kf_other\":0,\"kf_suppressed\":0,\
+             \"kf_reoffer\":0,\"kf_stall\":0,\"kf_hw_fallback\":0,\"kf_backlog\":0,\"kf_other\":0,\"kf_suppressed\":0,\
              \"irap_aus\":0,\"irap_bytes\":0,\"irap_follow_bytes\":0,\"recovery_n\":0,\
              \"recovery_p50_ms\":null,\"recovery_max_ms\":null,\"recovery_dropped\":0,\"frozen_ms\":30,\"concealed_ms\":40,\"concealed_pictures\":1,\"decode_aus\":1,\
-             \"decode_avg_ms\":3.0,\"decode_worst_ms\":3.0,\"presented_fps\":0.0,\"latency_decode_p50_ms\":4.0,\
+             \"decode_avg_ms\":3.0,\"decode_worst_ms\":3.0,\"backlog_skipped_aus\":0,\"presented_fps\":0.0,\"latency_decode_p50_ms\":4.0,\
              \"latency_decode_max_ms\":4.0,\"latency_present_p50_ms\":9.0,\"latency_present_max_ms\":31.0,\"rtt_ms\":null}"
         );
         // Counters were consumed.

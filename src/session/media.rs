@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use parking_lot::Mutex;
 
-use super::{AfterLoss, Event, Shared};
+use super::{AfterLoss, Event, Fps, Shared};
 use crate::audio::Player;
 use crate::proto::offers::{MediaOffer, SRTP_BLOB_LEN};
 use crate::rtp::assembler::{AccessUnit, Assembler, HoldStats, POLL_EVERY, TileMap};
@@ -38,13 +38,15 @@ pub enum KeyframeCause {
     Stall,
     /// Switched to the next decoder backend.
     HwFallback,
+    /// The decoder fell behind and dropped its queue (see [`backlog_bound`]).
+    Backlog,
     /// A keyframe arrived without parameter sets, or one was asked for on
     /// the control FIFO.
     Other,
 }
 
 impl KeyframeCause {
-    pub const ALL: [KeyframeCause; 8] = [
+    pub const ALL: [KeyframeCause; 9] = [
         KeyframeCause::Gap,
         KeyframeCause::DecodeError,
         KeyframeCause::Damaged,
@@ -52,12 +54,13 @@ impl KeyframeCause {
         KeyframeCause::Reoffer,
         KeyframeCause::Stall,
         KeyframeCause::HwFallback,
+        KeyframeCause::Backlog,
         KeyframeCause::Other,
     ];
 
     /// Caused by loss on the link: what loss recovery is measured on.
     pub fn is_loss(self) -> bool {
-        matches!(self, KeyframeCause::Gap | KeyframeCause::DecodeError | KeyframeCause::Damaged)
+        matches!(self, KeyframeCause::Gap | KeyframeCause::DecodeError | KeyframeCause::Damaged | KeyframeCause::Backlog)
     }
 
     pub fn name(self) -> &'static str {
@@ -69,6 +72,7 @@ impl KeyframeCause {
             KeyframeCause::Reoffer => "reoffer",
             KeyframeCause::Stall => "stall",
             KeyframeCause::HwFallback => "hw_fallback",
+            KeyframeCause::Backlog => "backlog",
             KeyframeCause::Other => "other",
         }
     }
@@ -85,7 +89,8 @@ pub enum Feedback {
 }
 
 pub(super) enum DecoderMsg {
-    Au { tile: usize, au: AccessUnit },
+    /// An access unit, and when it went into the queue.
+    Au { tile: usize, au: AccessUnit, queued: Instant },
     /// Start over from the next IDR.
     Reset(ResetWhy),
 }
@@ -206,7 +211,7 @@ fn route(tiles: &mut TileMap, dec: &Sender<DecoderMsg>, aus: Vec<AccessUnit>) ->
     for au in aus {
         match tiles.tile_of(au.ssrc) {
             Some(tile) => {
-                if dec.send(DecoderMsg::Au { tile, au }).is_err() {
+                if dec.send(DecoderMsg::Au { tile, au, queued: Instant::now() }).is_err() {
                     return false;
                 }
             }
@@ -484,7 +489,7 @@ pub(super) fn video_rx(
                 shared.touch(&shared.last_frame);
                 let _ = dec.send(DecoderMsg::Reset(ResetWhy::Adoption));
                 for (tile, au) in backlog {
-                    let _ = dec.send(DecoderMsg::Au { tile, au });
+                    let _ = dec.send(DecoderMsg::Au { tile, au, queued: Instant::now() });
                 }
                 let _ = fb.send(Feedback::Keyframe(None, KeyframeCause::Adoption));
             }
@@ -629,6 +634,34 @@ const HW_GRACE_AUS: u32 = 120;
 const TILE_GATHER: Duration = Duration::from_millis(4);
 /// Never hold a picture longer than this, even under a steady stream.
 const TILE_GATHER_MAX: Duration = Duration::from_millis(25);
+
+/// How long an access unit may wait in the decoder queue, in frame
+/// intervals of the offered rate. A decoder that keeps up decodes the burst
+/// of tiles of one frame within one interval. A hold that ends releases the
+/// frames it held at once, which takes about one more. One more covers a
+/// slow decode or a late wake of the decoder thread. An access unit that
+/// waited longer belongs to a frame that the screen should have shown
+/// frames ago, and the decoder only falls further behind: at 60 fps the
+/// bound is 50 ms, more than the round trip of a keyframe request on a LAN.
+const BACKLOG_FRAMES: u32 = 3;
+
+fn backlog_bound(fps: Fps) -> Duration {
+    Duration::from_secs(1) * BACKLOG_FRAMES / fps.value()
+}
+
+/// A complete IRAP access unit: it restarts the decoder, so nothing before
+/// it in decode order is needed. Part of a keyframe is not one.
+fn is_keyframe(au: &AccessUnit) -> bool {
+    au.complete && au.nalus.iter().any(|n| hevc::is_irap(n))
+}
+
+/// How many of the `queued` access units the decoder drops when the head
+/// waited past [`backlog_bound`]: those before the newest keyframe, or all
+/// of them when none is queued, as every other picture needs the ones
+/// before it.
+fn backlog_skip(queued: &[(usize, AccessUnit)]) -> usize {
+    queued.iter().rposition(|(_, au)| is_keyframe(au)).unwrap_or(queued.len())
+}
 
 struct DecodeLoop {
     shared: Arc<Shared>,
@@ -793,6 +826,33 @@ impl DecodeStats {
 }
 
 impl DecodeLoop {
+    fn new(shared: Arc<Shared>, opts: DecoderOptions, fb: Sender<Feedback>, decoder: Decoder, sync_tiles: bool) -> Self {
+        let hw = decoder.backend().is_hw();
+        DecodeLoop {
+            shared,
+            opts,
+            fb,
+            decoder,
+            params: ParamSets::default(),
+            active_sps: None,
+            awaiting_idr: true,
+            pts: 0,
+            origin: HashMap::new(),
+            epoch: 0,
+            irap_follow: 0,
+            lossy: false,
+            fed_without_output: hw.then_some(0),
+            batch: Vec::new(),
+            sync_tiles,
+            batch_started: None,
+            last_input: Instant::now(),
+            gather: GatherStats::new(),
+            stats: DecodeStats::new(),
+            dump: open_dump(),
+            dead: false,
+        }
+    }
+
     /// Reopens the decoder on the current backend, or on the ones after it
     /// when `next` is set (the current one can't handle the stream).
     fn restart(&mut self, next: bool) {
@@ -840,8 +900,7 @@ impl DecodeLoop {
         if !au.nalus.iter().any(|n| hevc::is_slice(n)) {
             return;
         }
-        // Part of a keyframe is not one: it doesn't restart the decoder.
-        let irap = au.complete && au.nalus.iter().any(|n| hevc::is_irap(n));
+        let irap = is_keyframe(&au);
         let bytes: u64 = au.nalus.iter().map(|n| n.len() as u64).sum();
         let m = &self.shared.metrics;
         if irap {
@@ -941,6 +1000,72 @@ impl DecodeLoop {
         }
     }
 
+    /// The head of the queue waited past [`backlog_bound`]: drops the
+    /// queue up to its newest keyframe. With none queued, it drops it all
+    /// and treats that as a loss, which asks for a keyframe. A reset in the
+    /// queue is done in its place, and drops what came before it.
+    fn catch_up(&mut self, head: (usize, AccessUnit), rx: &Receiver<DecoderMsg>) {
+        let mut queued = vec![head];
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                DecoderMsg::Au { tile, au, .. } => queued.push((tile, au)),
+                DecoderMsg::Reset(why) => {
+                    self.absorb_params(queued.drain(..));
+                    self.reset(why);
+                }
+            }
+        }
+        let skip = backlog_skip(&queued);
+        let rest = queued.split_off(skip);
+        tracing::debug!("decoder behind: dropped {skip} queued access units, {} left", rest.len());
+        self.shared.metrics.backlog_skipped.fetch_add(skip as u64, Ordering::Relaxed);
+        if rest.is_empty()
+            && !self.awaiting_idr
+            && let Some(&(tile, _)) = queued.last()
+        {
+            if self.shared.op().after_loss == AfterLoss::Conceal {
+                self.lossy = true;
+            } else {
+                self.awaiting_idr = true;
+            }
+            self.loss_keyframe(tile, self.epoch, KeyframeCause::Backlog);
+        }
+        self.absorb_params(queued);
+        for (tile, au) in rest {
+            self.access_unit(tile, au);
+        }
+    }
+
+    /// Keeps the parameter sets of access units that are not decoded.
+    fn absorb_params(&mut self, aus: impl IntoIterator<Item = (usize, AccessUnit)>) {
+        for (_, au) in aus {
+            for nal in au.nalus.iter().filter(|n| hevc::is_param_set(n)) {
+                self.params.absorb(nal);
+            }
+        }
+    }
+
+    fn reset(&mut self, why: ResetWhy) {
+        if why == ResetWhy::Adoption {
+            // A new stream: an open outage belongs to the old one, and its
+            // recovery would be the adoption's.
+            self.shared.metrics.end_outage();
+            // New SSRC group: new parameter sets will follow.
+            self.params = ParamSets::default();
+            self.active_sps = None;
+        }
+        // A stall reset keeps the outage open: the epoch carries on, so the
+        // next IRAP still ends it. It keeps the parameter sets too, as the
+        // host may send that IDR on the same SSRCs without repeating them;
+        // wiping them would refuse every keyframe from then on.
+        self.shared.metrics.shown(false);
+        self.irap_follow = 0;
+        self.lossy = false;
+        self.batch.clear();
+        self.batch_started = None;
+        self.restart(false);
+    }
+
     fn publish(&mut self, pic: Picture) {
         let Some(Origin { tile, donl, recovered, epoch, concealed, received }) = self.origin.remove(&pic.pts) else {
             return;
@@ -1029,60 +1154,21 @@ pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<
     };
     tracing::info!("video decoder: {:?}", decoder.backend());
     shared.metrics.set_decoder(decoder.backend().name());
-    let hw = decoder.backend().is_hw();
-    let mut st = DecodeLoop {
-        shared: shared.clone(),
-        opts,
-        fb,
-        decoder,
-        params: ParamSets::default(),
-        active_sps: None,
-        awaiting_idr: true,
-        pts: 0,
-        origin: HashMap::new(),
-        epoch: 0,
-        irap_follow: 0,
-        lossy: false,
-        fed_without_output: hw.then_some(0),
-        batch: Vec::new(),
-        sync_tiles,
-        batch_started: None,
-        last_input: Instant::now(),
-        gather: GatherStats::new(),
-        stats: DecodeStats::new(),
-        dump: open_dump(),
-        dead: false,
-    };
+    let mut st = DecodeLoop::new(shared.clone(), opts, fb, decoder, sync_tiles);
     while !shared.stopped() && !st.dead {
         match rx.recv_timeout(st.wait()) {
-            Ok(DecoderMsg::Au { tile, au }) => {
-                st.access_unit(tile, au);
+            Ok(DecoderMsg::Au { tile, au, queued }) => {
+                if queued.elapsed() > backlog_bound(shared.op().fps) {
+                    st.catch_up((tile, au), &rx);
+                } else {
+                    st.access_unit(tile, au);
+                }
                 st.last_input = Instant::now();
                 if st.batch_started.is_some_and(|t| t.elapsed() >= TILE_GATHER_MAX) {
                     st.flush(Flush::MaxHold);
                 }
             }
-            Ok(DecoderMsg::Reset(why)) => {
-                if why == ResetWhy::Adoption {
-                    // A new stream: an open outage belongs to the old one,
-                    // and its recovery would be the adoption's.
-                    shared.metrics.end_outage();
-                    // New SSRC group: new parameter sets will follow.
-                    st.params = ParamSets::default();
-                    st.active_sps = None;
-                }
-                // A stall reset keeps the outage open: the epoch carries on,
-                // so the next IRAP still ends it. It keeps the parameter
-                // sets too, as the host may send that IDR on the same SSRCs
-                // without repeating them; wiping them would refuse every
-                // keyframe from then on.
-                shared.metrics.shown(false);
-                st.irap_follow = 0;
-                st.lossy = false;
-                st.batch.clear();
-                st.batch_started = None;
-                st.restart(false);
-            }
+            Ok(DecoderMsg::Reset(why)) => st.reset(why),
             Err(RecvTimeoutError::Timeout) => st.flush(Flush::Idle),
             Err(RecvTimeoutError::Disconnected) => return,
         }
@@ -1470,6 +1556,54 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    const TRAIL: u8 = 1;
+    const IDR: u8 = 19;
+
+    /// An access unit of tile `tile` with one NAL unit of type `nal`.
+    fn au(tile: usize, nal: u8, complete: bool) -> (usize, AccessUnit) {
+        let nalus = vec![vec![nal << 1, 1, 0xaf]];
+        (tile, AccessUnit { ssrc: tile as u32, nalus, donl: None, complete, recovered: false, received: Instant::now() })
+    }
+
+    #[test]
+    fn backlog_bound_is_three_frame_intervals() {
+        assert_eq!(backlog_bound(Fps::Sixty), Duration::from_millis(50));
+        assert_eq!(backlog_bound(Fps::Thirty), Duration::from_millis(100));
+    }
+
+    #[test]
+    fn decoder_behind_skips_to_the_newest_keyframe() {
+        // Two keyframes on tile 0: decoding starts at the second, with the
+        // tiles of its frame after it.
+        let queued = [au(0, TRAIL, true), au(0, IDR, true), au(1, TRAIL, true), au(0, IDR, true), au(1, TRAIL, true)];
+        assert_eq!(backlog_skip(&queued), 3);
+        // Only P pictures: each needs the one before it, so all go.
+        assert_eq!(backlog_skip(&[au(0, TRAIL, true), au(1, TRAIL, true)]), 2);
+        // Part of a keyframe is not one.
+        assert_eq!(backlog_skip(&[au(0, IDR, false), au(1, TRAIL, true)]), 2);
+    }
+
+    #[test]
+    fn decoder_behind_without_a_keyframe_drops_its_queue_and_asks_for_one() {
+        let (shared, ..) = crate::session::tests::connected(None);
+        let (fb, feedback) = crossbeam_channel::unbounded();
+        let opts = DecoderOptions { kind: decoder::DecoderKind::Software, threads: 1, vaapi_device: None };
+        let mut st = DecodeLoop::new(shared.clone(), opts.clone(), fb, Decoder::new(&opts).unwrap(), false);
+        // Mid-stream: the decoder has had its keyframe.
+        st.awaiting_idr = false;
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let queued = Instant::now() - Duration::from_millis(80);
+        for (tile, au) in [au(1, TRAIL, true), au(2, TRAIL, true), au(3, TRAIL, true)] {
+            tx.send(DecoderMsg::Au { tile, au, queued }).unwrap();
+        }
+        st.catch_up(au(0, TRAIL, true), &rx);
+        assert!(rx.is_empty());
+        assert_eq!(shared.metrics.backlog_skipped.load(Ordering::Relaxed), 4);
+        assert!(st.awaiting_idr);
+        assert!(matches!(feedback.try_recv(), Ok(Feedback::Keyframe(Some(3), KeyframeCause::Backlog))));
+        assert!(feedback.try_recv().is_err());
+    }
+
     #[test]
     fn given_up_access_unit_reaches_decoder_incomplete() {
         let t0 = Instant::now();
@@ -1485,7 +1619,7 @@ mod tests {
         let got: Vec<(usize, bool, usize)> = rx
             .try_iter()
             .map(|m| match m {
-                DecoderMsg::Au { tile, au } => (tile, au.complete, au.nalus.len()),
+                DecoderMsg::Au { tile, au, .. } => (tile, au.complete, au.nalus.len()),
                 DecoderMsg::Reset(_) => panic!("unexpected reset"),
             })
             .collect();
