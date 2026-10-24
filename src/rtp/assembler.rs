@@ -567,18 +567,19 @@ impl TileMap {
         if self.tiles.is_empty() && self.first_packet.is_some_and(|t| t.elapsed() < INITIAL_SETTLE) {
             return None;
         }
-        let mut cands: Vec<u32> = self
-            .counts
-            .iter()
-            .filter(|&(s, &n)| n >= ADOPT_MIN_PACKETS && !self.tiles.contains(s) && !self.blacklist.contains(s))
-            .map(|(&s, _)| s)
-            .collect();
+        let mut cands: Vec<u32> =
+            self.counts.keys().filter(|s| !self.tiles.contains(s) && !self.blacklist.contains(s)).copied().collect();
         cands.sort_unstable();
+        // A group starts at a busy SSRC: the base tile carries the keyframe
+        // that starts a stream. The other tiles need only one packet, as a
+        // tile of one plain colour fits its picture in fewer than
+        // ADOPT_MIN_PACKETS, and a static one sends nothing after it.
         let mut runs: Vec<Vec<u32>> = Vec::new();
         for s in cands {
             match runs.last_mut() {
                 Some(r) if r.len() < want && s.wrapping_sub(*r.last().unwrap()) == 1 => r.push(s),
-                _ => runs.push(vec![s]),
+                _ if self.counts[&s] >= ADOPT_MIN_PACKETS => runs.push(vec![s]),
+                _ => {}
             }
         }
         // Several quality tiers may stream at once; take the busiest group.
@@ -596,13 +597,23 @@ impl TileMap {
         let blacklist = &self.blacklist;
         self.counts.retain(|s, _| !blacklist.contains(s));
         let backlog = std::mem::take(&mut self.backlog);
-        Some(
-            backlog
-                .into_iter()
-                .filter_map(|au| self.tile_of(au.ssrc).map(|t| (t, au)))
-                .collect(),
-        )
+        let mut replay: Vec<(usize, AccessUnit)> =
+            backlog.into_iter().filter_map(|au| self.tile_of(au.ssrc).map(|t| (t, au))).collect();
+        in_decode_order(&mut replay);
+        Some(replay)
     }
+}
+
+/// Sorts access units of the adopted tiles into decode order. Before the
+/// adoption each SSRC was ordered on its own, so they left the assembler in
+/// the order they completed: a small access unit of one tile before the
+/// large keyframe of the base tile that it references. DONL is one counter
+/// across the tiles; it counts from the first access unit, as the backlog
+/// spans far less than half its range. Equal DONLs go in tile order, and
+/// access units without one stay in arrival order before the others.
+fn in_decode_order(aus: &mut [(usize, AccessUnit)]) {
+    let Some(first) = aus.iter().find_map(|(_, au)| au.donl) else { return };
+    aus.sort_by_key(|(tile, au)| au.donl.map(|d| (d.wrapping_sub(first) as i16, *tile)));
 }
 
 #[cfg(test)]
@@ -945,6 +956,59 @@ mod tests {
         // A switch moves to the other group and blacklists the first.
         assert!(m.try_adopt(4, true).is_some());
         assert_eq!(m.ssrcs(), &[10, 11, 12, 13]);
+    }
+
+    fn settled() -> TileMap {
+        TileMap { first_packet: Some(Instant::now() - Duration::from_secs(1)), ..Default::default() }
+    }
+
+    fn count(m: &mut TileMap, ssrc: u32, packets: u32) {
+        for _ in 0..packets {
+            m.count_packet(ssrc);
+        }
+    }
+
+    #[test]
+    fn adopts_a_group_with_a_quiet_tile() {
+        let mut m = settled();
+        // Tiles 1 and 3 are one plain colour: their first pictures took 2
+        // packets and 1, and they sent nothing since. SSRC 29 is a stray
+        // packet just below the group.
+        for (ssrc, packets) in [(29, 1), (30, 40), (31, 2), (32, 25), (33, 1)] {
+            count(&mut m, ssrc, packets);
+        }
+        assert!(m.try_adopt(4, false).is_some());
+        assert_eq!(m.ssrcs(), &[30, 31, 32, 33]);
+
+        // The base tile carries the keyframe, so a quiet one is no group.
+        let mut m = settled();
+        for (ssrc, packets) in [(40, 2), (41, 30), (42, 30), (43, 30)] {
+            count(&mut m, ssrc, packets);
+        }
+        assert!(m.try_adopt(4, false).is_none());
+    }
+
+    #[test]
+    fn adoption_replays_the_backlog_in_decode_order() {
+        let mut m = settled();
+        count(&mut m, 20, ADOPT_MIN_PACKETS);
+        count(&mut m, 21, 1);
+        let au = |ssrc, donl| AccessUnit {
+            ssrc,
+            nalus: vec![],
+            donl: Some(donl),
+            complete: true,
+            recovered: false,
+            received: Instant::now(),
+        };
+        // The small picture of tile 1 completed before the keyframe of tile
+        // 0 that it references, and DONL wraps between them.
+        for (ssrc, donl) in [(21, 0), (20, 65535), (21, 2), (20, 1)] {
+            m.stash(au(ssrc, donl));
+        }
+        let replay = m.try_adopt(2, false).unwrap();
+        let order: Vec<(usize, Option<u16>)> = replay.iter().map(|(t, au)| (*t, au.donl)).collect();
+        assert_eq!(order, [(0, Some(65535)), (1, Some(0)), (0, Some(1)), (1, Some(2))]);
     }
 
     /// One AU on SSRC 5 whose middle packet is lost, held and given up.

@@ -47,7 +47,10 @@ fn serve(session: &Session, events: &Receiver<Event>, request: impl Fn() -> Opti
     for event in events {
         match event {
             Event::Connected => tracing::info!("connected; decoding without a window"),
-            Event::Frame => canvas.put(session.frames().take()),
+            Event::Frame => {
+                canvas.put(session.frames().take());
+                session.presented();
+            }
             Event::Canvas { width, height } => {
                 tracing::info!("canvas {width}x{height}");
                 canvas.resize(width, height);

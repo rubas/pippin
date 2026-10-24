@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 
 const FIRST_DELAY: Duration = Duration::from_secs(1);
 const MAX_DELAY: Duration = Duration::from_secs(30);
-/// Stop reconnecting once this long has passed without any video.
+/// Stop reconnecting once this long has passed since the drop without a
+/// picture.
 const GIVE_UP_AFTER: Duration = Duration::from_secs(10 * 60);
 
 /// Doubling delay between reconnect attempts, capped at [`MAX_DELAY`].
@@ -52,9 +53,9 @@ pub struct Reconnector {
     connected_once: bool,
     reconnecting: bool,
     backoff: Backoff,
-    /// Last sign the host really works: the latest picture, or the first
-    /// connect if none has arrived yet.
-    alive_at: Option<Instant>,
+    /// When the current outage began: the first drop since the latest
+    /// picture. `None` while the session works.
+    down_since: Option<Instant>,
 }
 
 impl Reconnector {
@@ -71,18 +72,13 @@ impl Reconnector {
     /// backoff keeps growing until [`Self::video`].
     pub fn connected(&mut self) {
         self.connected_once = true;
-        self.alive_at.get_or_insert_with(Instant::now);
         self.reconnecting = false;
     }
 
     /// A picture arrived: the session really works, so the next drop
-    /// starts again from the first delay.
+    /// starts a new outage, with the first delay and the full budget.
     pub fn video(&mut self) {
-        self.video_at(Instant::now());
-    }
-
-    fn video_at(&mut self, now: Instant) {
-        self.alive_at = Some(now);
+        self.down_since = None;
         self.backoff.reset();
     }
 
@@ -96,7 +92,8 @@ impl Reconnector {
         if !(self.enabled && self.connected_once && retryable) {
             return OnEnd::Exit;
         }
-        if self.alive_at.is_some_and(|t| now.duration_since(t) >= GIVE_UP_AFTER) {
+        let down_since = *self.down_since.get_or_insert(now);
+        if now.duration_since(down_since) >= GIVE_UP_AFTER {
             return OnEnd::GiveUp;
         }
         self.reconnecting = true;
@@ -168,17 +165,44 @@ mod tests {
     }
 
     #[test]
-    fn gives_up_after_ten_minutes_without_video() {
+    fn hour_long_session_gets_the_full_budget_at_its_first_drop() {
         let mut r = Reconnector::new(true);
         r.connected();
+        r.video();
+        // A still screen sends no picture for an hour, then the link drops.
+        let drop = Instant::now() + Duration::from_secs(3600);
+        assert_eq!(r.ended_at(true, drop), secs(1));
+        assert_eq!(r.ended_at(true, drop + GIVE_UP_AFTER - Duration::from_secs(1)), secs(2));
+        assert_eq!(r.ended_at(true, drop + GIVE_UP_AFTER), OnEnd::GiveUp);
+    }
+
+    #[test]
+    fn second_drop_after_a_recovery_starts_a_new_budget() {
+        let mut r = Reconnector::new(true);
+        r.connected();
+        r.video();
+        // The first outage uses 9 of its 10 minutes, then video is back.
         let t0 = Instant::now();
-        r.video_at(t0);
-        assert_eq!(r.ended_at(true, t0 + Duration::from_secs(5)), secs(1));
-        assert_eq!(r.ended_at(true, t0 + GIVE_UP_AFTER - Duration::from_secs(1)), secs(2));
+        assert_eq!(r.ended_at(true, t0), secs(1));
+        assert_eq!(r.ended_at(true, t0 + Duration::from_secs(540)), secs(2));
+        r.connected();
+        r.video();
+        let second = t0 + Duration::from_secs(600);
+        assert_eq!(r.ended_at(true, second), secs(1));
+        assert_eq!(r.ended_at(true, second + GIVE_UP_AFTER - Duration::from_secs(1)), secs(2));
+        assert_eq!(r.ended_at(true, second + GIVE_UP_AFTER), OnEnd::GiveUp);
+    }
+
+    #[test]
+    fn handshake_without_a_picture_keeps_the_outage_budget() {
+        let mut r = Reconnector::new(true);
+        r.connected();
+        r.video();
+        let t0 = Instant::now();
+        assert_eq!(r.ended_at(true, t0), secs(1));
+        // The host accepts again but never sends a picture.
+        r.connected();
         assert_eq!(r.ended_at(true, t0 + GIVE_UP_AFTER), OnEnd::GiveUp);
-        // A picture in between restarts the clock.
-        r.video_at(t0 + GIVE_UP_AFTER);
-        assert_eq!(r.ended_at(true, t0 + GIVE_UP_AFTER + Duration::from_secs(60)), secs(1));
     }
 
     #[test]

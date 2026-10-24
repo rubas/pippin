@@ -23,6 +23,9 @@ pub const BTN_RIGHT: u8 = 1 << 1;
 pub const BTN_MIDDLE: u8 = 1 << 2;
 pub const BTN_SCROLL_UP: u8 = 1 << 3;
 pub const BTN_SCROLL_DOWN: u8 = 1 << 4;
+/// Buttons 6 and 7 of X11 and the RFB viewers that follow it.
+pub const BTN_SCROLL_LEFT: u8 = 1 << 5;
+pub const BTN_SCROLL_RIGHT: u8 = 1 << 6;
 
 /// 0x21 ViewerInfo followed by Apple's 12-byte 0x12 follow-up. The 32-byte
 /// command mask matches Screen Sharing.app and unlocks clipboard push and

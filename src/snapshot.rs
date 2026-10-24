@@ -1,12 +1,13 @@
 //! Snapshots of the decoded canvas as RGB PNG files, for scripted tests.
-//! The colours match the renderer's shader; the chroma takes the nearest
-//! sample instead of a filtered one.
+//! The colours match the renderer's shader, with the stream's colour; the
+//! chroma takes the nearest sample instead of a filtered one.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use image::{Rgb, RgbImage};
 
+use crate::video::colour::Conversion;
 use crate::video::decoder::{Layout, Picture, PlaneRef};
 
 /// The latest picture of each tile, kept to draw the whole canvas.
@@ -53,24 +54,15 @@ impl Canvas {
         let mut img = RgbImage::new(first.width, height);
         for (i, pic) in tiles.iter().flatten().enumerate() {
             let planes: Vec<_> = (0..pic.layout.planes()).map(|p| pic.plane(p)).collect();
-            draw_tile(&mut img, i as u32 * pic.height, pic.layout, &planes);
+            draw_tile(&mut img, i as u32 * pic.height, pic.layout, &pic.colour.conversion(), &planes);
         }
         Some(img)
     }
 }
 
-/// BT.709, full range: the renderer's shader in integers out.
-fn rgb(y: u8, u: u8, v: u8) -> Rgb<u8> {
-    let y = y as f32 / 255.0;
-    let cb = u as f32 / 255.0 - 0.5;
-    let cr = v as f32 / 255.0 - 0.5;
-    let byte = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
-    Rgb([byte(y + 1.5748 * cr), byte(y - 0.187324 * cb - 0.468124 * cr), byte(y + 1.8556 * cb)])
-}
-
 /// Converts one tile's planes into `img` from row `y0` down, as the
 /// renderer stacks tiles. What falls outside `img` is left out.
-fn draw_tile(img: &mut RgbImage, y0: u32, layout: Layout, planes: &[PlaneRef]) {
+fn draw_tile(img: &mut RgbImage, y0: u32, layout: Layout, conversion: &Conversion, planes: &[PlaneRef]) {
     let luma = planes[0];
     // Plane, bytes per texel and byte in the texel of Y, U and V.
     let components: [_; 3] = std::array::from_fn(|c| {
@@ -81,11 +73,11 @@ fn draw_tile(img: &mut RgbImage, y0: u32, layout: Layout, planes: &[PlaneRef]) {
     let height = luma.height.min(img.height().saturating_sub(y0));
     for y in 0..height {
         for x in 0..width {
-            let [l, u, v] = components.map(|(p, texel, ch)| {
+            let yuv = components.map(|(p, texel, ch)| {
                 let (px, py) = (x * p.width / luma.width, y * p.height / luma.height);
                 p.data[(py * p.stride + px * texel + ch) as usize]
             });
-            img.put_pixel(x, y0 + y, rgb(l, u, v));
+            img.put_pixel(x, y0 + y, Rgb(conversion.rgb(yuv)));
         }
     }
 }
@@ -102,19 +94,17 @@ pub fn write_png(img: &RgbImage, path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::video::colour::{Colour, Matrix, Range};
 
     const RED: [u8; 3] = [54, 98, 255];
     const BLUE: [u8; 3] = [18, 255, 116];
+    /// RED and BLUE in RGB: 8-bit full-range samples round pure red and
+    /// blue to 254.
+    const RED_RGB: [u8; 3] = [254, 0, 0];
+    const BLUE_RGB: [u8; 3] = [0, 0, 254];
 
     fn plane(data: &[u8], stride: u32, width: u32, height: u32) -> PlaneRef<'_> {
         PlaneRef { data, stride, width, height }
-    }
-
-    #[test]
-    fn converts_bt709_full_range() {
-        assert_eq!(rgb(54, 98, 255).0, [255, 0, 0]);
-        assert_eq!(rgb(18, 255, 116).0, [0, 0, 255]);
-        assert_eq!(rgb(255, 128, 128).0, [255, 255, 255]);
     }
 
     #[test]
@@ -129,7 +119,7 @@ mod tests {
         for (i, c) in [RED, BLUE].into_iter().enumerate() {
             let [y, u, v] = tile(c);
             let planes = [plane(&y, 6, 4, 2), plane(&u, 3, 2, 1), plane(&v, 3, 2, 1)];
-            draw_tile(&mut img, i as u32 * 2, Layout::Planar, &planes);
+            draw_tile(&mut img, i as u32 * 2, Layout::Planar, &Colour::default().conversion(), &planes);
         }
         let path = std::env::temp_dir().join(format!("pippin-snapshot-test-{}.png", std::process::id()));
         write_png(&img, &path).unwrap();
@@ -139,9 +129,9 @@ mod tests {
         let back = back.into_rgb8();
         assert_eq!(back.dimensions(), (4, 3));
         for x in 0..4 {
-            assert_eq!(back.get_pixel(x, 0).0, [255, 0, 0]);
-            assert_eq!(back.get_pixel(x, 1).0, [255, 0, 0]);
-            assert_eq!(back.get_pixel(x, 2).0, [0, 0, 255]);
+            assert_eq!(back.get_pixel(x, 0).0, RED_RGB);
+            assert_eq!(back.get_pixel(x, 1).0, RED_RGB);
+            assert_eq!(back.get_pixel(x, 2).0, BLUE_RGB);
         }
     }
 
@@ -156,7 +146,22 @@ mod tests {
         canvas.put(vec![(0, Picture::filled(4, 2, RED))]);
         let img = canvas.image().unwrap();
         assert_eq!(img.dimensions(), (4, 4));
-        assert!(img.pixels().all(|p| p.0 == [255, 0, 0]));
+        assert!(img.pixels().all(|p| p.0 == RED_RGB));
+    }
+
+    #[test]
+    fn a_snapshot_converts_with_the_colour_of_its_picture() {
+        // Limited-range white over limited-range black, in two tiles.
+        let limited = Colour { range: Range::Limited, matrix: Matrix::Bt709 };
+        let mut canvas = Canvas::default();
+        canvas.resize(2, 4);
+        for (tile, y) in [(0, 235), (1, 16)] {
+            let mut pic = Picture::filled(2, 2, [y, 128, 128]);
+            pic.colour = limited;
+            canvas.put(vec![(tile, pic)]);
+        }
+        let img = canvas.image().unwrap();
+        assert_eq!([img.get_pixel(0, 0).0, img.get_pixel(1, 3).0], [[255; 3], [0; 3]]);
     }
 
     #[test]
@@ -171,11 +176,11 @@ mod tests {
         // NV12: one 2×2 tile, the chroma plane holds U then V.
         let (y, uv) = ([RED[0]; 4], [RED[1], RED[2]]);
         let mut img = RgbImage::new(2, 2);
-        draw_tile(&mut img, 0, Layout::SemiPlanar, &[plane(&y, 2, 2, 2), plane(&uv, 2, 1, 1)]);
-        assert!(img.pixels().all(|p| p.0 == [255, 0, 0]));
+        draw_tile(&mut img, 0, Layout::SemiPlanar, &Colour::default().conversion(), &[plane(&y, 2, 2, 2), plane(&uv, 2, 1, 1)]);
+        assert!(img.pixels().all(|p| p.0 == RED_RGB));
         // VUYX: one plane of V, U, Y, X bytes.
         let vuyx = [BLUE[2], BLUE[1], BLUE[0], 0xff].repeat(4);
-        draw_tile(&mut img, 0, Layout::Vuyx, &[plane(&vuyx, 8, 2, 2)]);
-        assert!(img.pixels().all(|p| p.0 == [0, 0, 255]));
+        draw_tile(&mut img, 0, Layout::Vuyx, &Colour::default().conversion(), &[plane(&vuyx, 8, 2, 2)]);
+        assert!(img.pixels().all(|p| p.0 == BLUE_RGB));
     }
 }

@@ -202,8 +202,63 @@ function fullscreen(vdisplay: boolean, macDisplay = false): Scenario {
   };
 }
 
+const SCROLL_APP = "/tmp/scrolllog.app";
+const SCROLL_LOG = "/tmp/scrolllog.log";
+const SCROLL_PLIST = `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>scrolllog</string>
+<key>CFBundleIdentifier</key><string>dev.rubas.scrolllog</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+</dict></plist>
+`;
+
+/** A scroll event that reached scrolllog, with the sign of the device: a positive x is left, a positive y up. */
+type Scrolled = { x: number; y: number };
+
+async function scrolled(ctx: Context): Promise<Scrolled[]> {
+  const lines = (await ctx.guest.sh(`cat ${SCROLL_LOG}`)).split("\n");
+  return lines
+    .filter((l) => l.startsWith("scroll "))
+    .map((l) => {
+      const [, x, y] = l.split(" ");
+      return { x: Number(x), y: Number(y) };
+    });
+}
+
+const scroll: Scenario = {
+  about: "scroll down and right with the control FIFO, and see both reach a window on the Mac",
+  async run(ctx) {
+    await connected(ctx, ["WindowServer", "screensharingd"], false, async (session) => {
+      // After the connect, so that the window covers pippin's display.
+      await ctx.guest.sh(`mkdir -p ${SCROLL_APP}/Contents/MacOS && : >${SCROLL_LOG}`);
+      await ctx.guest.put(`${SCROLL_APP}/Contents/Info.plist`, SCROLL_PLIST);
+      await ctx.guest.put(`${SCROLL_APP}/Contents/MacOS/scrolllog`, await swiftTool("scrolllog"), "755");
+      await ctx.guest.sh(`open -n ${SCROLL_APP} --args ${SCROLL_LOG}`);
+      ctx.onTeardown(async () => Bun.write(`${ctx.out}/scrolllog.log`, await ctx.guest.sh(`cat ${SCROLL_LOG}`)));
+      await waitFor("scrolllog to show its window", 20_000, async () =>
+        (await ctx.guest.sh(`cat ${SCROLL_LOG}`)).includes("ready") || undefined,
+      );
+      session.send("pointer 200 200");
+      await Bun.sleep(1000);
+      session.send("scroll 0 3");
+      await Bun.sleep(2000);
+      const vertical = await scrolled(ctx);
+      session.send("scroll 2 0");
+      await Bun.sleep(2000);
+      const horizontal = (await scrolled(ctx)).slice(vertical.length);
+      await session.snapshot("1-scrolllog");
+      const show = (events: Scrolled[]) => events.map((e) => `${e.x},${e.y}`).join(" ") || "none";
+      // AppKit can merge scroll events, so the count of events is not the count of steps.
+      const all = (events: Scrolled[], ok: (e: Scrolled) => boolean) => events.length > 0 && events.every(ok);
+      ctx.check("scroll down", all(vertical, (e) => e.x === 0 && e.y < 0), `events ${show(vertical)}`);
+      ctx.check("scroll right", all(horizontal, (e) => e.x < 0 && e.y === 0), `events ${show(horizontal)}`);
+    });
+  },
+};
+
 export const SCENARIOS: Record<string, Scenario> = {
   smoke,
+  scroll,
   fullscreen: fullscreen(true),
   "fullscreen-no-vdisplay": fullscreen(false),
   "fullscreen-own-display": fullscreen(true, true),
