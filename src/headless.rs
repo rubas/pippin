@@ -2,9 +2,10 @@
 //! the video and shows nothing. The control FIFO sends the input and asks
 //! for snapshots.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::proto::messages::DisplayRequest;
@@ -20,8 +21,9 @@ impl EventSink for ChannelSink {
 }
 
 /// Runs one session with a Mac display of `size` points at `scale` pixels
-/// per point. `quit` on the control FIFO ends it without an error; it does
-/// not reconnect.
+/// per point. Only `quit` on the control FIFO ends it without an error,
+/// and only when no snapshot still waits. It does not reconnect, and a
+/// snapshot that fails to write ends it too.
 pub fn run(cfg: Config, size: (u32, u32), scale: f64) -> Result<()> {
     let op = cfg.op.clone();
     let pixels = |v: u32| (v as f64 * scale).round() as u32;
@@ -45,8 +47,8 @@ fn serve(session: &Session, events: &Receiver<Event>, request: impl Fn() -> Disp
                 canvas.resize(width, height);
             }
             Event::Cursor(_) => {}
-            Event::Closed(None) => return Ok(()),
-            Event::Closed(Some(reason)) | Event::Lost(reason) => bail!(reason),
+            Event::Closed(reason) => return closed(reason, &snapshots),
+            Event::Lost(reason) => bail!(reason),
             Event::Reconfigure => session.resize(request()),
             Event::Snapshot(path) => snapshots.push(path),
         }
@@ -55,13 +57,37 @@ fn serve(session: &Session, events: &Receiver<Event>, request: impl Fn() -> Disp
             && let Some(img) = canvas.image()
         {
             for path in snapshots.drain(..) {
-                match snapshot::write_png(&img, &path) {
-                    Ok(()) => tracing::info!("snapshot {}", path.display()),
-                    Err(e) => tracing::warn!("snapshot {}: {e:#}", path.display()),
-                }
+                snapshot::write_png(&img, &path).with_context(|| format!("snapshot {}", path.display()))?;
+                tracing::info!("snapshot {}", path.display());
             }
         }
     }
     // The session holds the sender, so the events never run out.
     Ok(())
+}
+
+/// How the run ends when the session closes for good: `reason` is `None`
+/// after `quit`. Snapshots that still wait for a whole picture are an error.
+fn closed(reason: Option<String>, waiting: &[PathBuf]) -> Result<()> {
+    if let Some(reason) = reason {
+        bail!(reason);
+    }
+    if !waiting.is_empty() {
+        let paths: Vec<_> = waiting.iter().map(|p| p.display().to_string()).collect();
+        bail!("quit before the first whole picture; no snapshot written to {}", paths.join(", "));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quit_with_waiting_snapshots_is_an_error() {
+        assert!(closed(None, &[]).is_ok());
+        let e = closed(None, &["/run/t/0.png".into(), "/run/t/1.png".into()]).unwrap_err();
+        assert_eq!(e.to_string(), "quit before the first whole picture; no snapshot written to /run/t/0.png, /run/t/1.png");
+        assert_eq!(closed(Some("host ended the session".into()), &[]).unwrap_err().to_string(), "host ended the session");
+    }
 }
