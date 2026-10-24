@@ -415,13 +415,14 @@ impl ApplicationHandler<Tagged> for App {
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => self.key(&event),
             WindowEvent::CursorEntered { .. } => self.pointer = None,
             WindowEvent::CursorMoved { position, .. } => {
-                self.pointer = Some(self.pointer.map_or(Track::at(position), |t| t.moved(position)));
+                let now = Instant::now();
+                self.pointer = Some(self.pointer.map_or(Track::at(position, now), |t| t.moved(position, now)));
                 self.send_pointer(self.buttons);
             }
             WindowEvent::CursorLeft { .. } => {
-                let size = self.window.as_ref().map(|w| w.inner_size());
-                if let Some(exit) = self.pointer.zip(size).and_then(|(t, size)| t.exit(size)) {
-                    self.pointer = Some(Track::at(exit));
+                let (size, now) = (self.window.as_ref().map(|w| w.inner_size()), Instant::now());
+                if let Some(exit) = self.pointer.zip(size).and_then(|(t, size)| t.exit(size, now)) {
+                    self.pointer = Some(Track::at(exit, now));
                     self.send_pointer(self.buttons);
                 }
             }
