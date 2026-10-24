@@ -856,7 +856,7 @@ impl DecodeLoop {
             last_input: Instant::now(),
             gather: GatherStats::new(),
             stats: DecodeStats::new(),
-            dump: open_dump(),
+            dump: None,
             dead: false,
             keyframe_done: None,
             pending: VecDeque::new(),
@@ -1188,7 +1188,7 @@ pub(super) fn decoder(shared: Arc<Shared>, rx: Receiver<DecoderMsg>, fb: Sender<
     };
     tracing::info!("video decoder: {:?}", decoder.backend());
     shared.metrics.set_decoder(decoder.backend().name());
-    let mut st = DecodeLoop::new(shared.clone(), opts, fb, decoder, sync_tiles);
+    let mut st = DecodeLoop { dump: open_dump(), ..DecodeLoop::new(shared.clone(), opts, fb, decoder, sync_tiles) };
     while !shared.stopped() && !st.dead {
         let msg = match st.pending.pop_front() {
             Some((tile, au, queued)) => Ok(DecoderMsg::Au { tile, au, queued }),
