@@ -2777,6 +2777,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wayland-client",
+ "wayland-protocols",
  "wgpu",
  "winit",
  "wl-clipboard-rs",

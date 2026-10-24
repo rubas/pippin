@@ -3,6 +3,7 @@
 //! display scaled to fit.
 
 pub mod dialog;
+mod inhibit;
 pub(crate) mod keymap;
 mod reconnect;
 mod render;
@@ -17,13 +18,15 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+use winit::keyboard::{ModifiersState, PhysicalKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
 use winit::window::{CursorIcon, CustomCursor, Window, WindowAttributes, WindowId};
 
 use crate::proto::messages::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, DisplayRequest};
 use crate::session::{Config, CursorShape, Event, EventSink, Session};
+use inhibit::ShortcutInhibitor;
+use keymap::{KeyInput, Keyboard, Out};
 use reconnect::{OnEnd, Reconnector};
 use render::Renderer;
 
@@ -85,6 +88,8 @@ struct App {
     opts: Options,
     proxy: EventLoopProxy<Tagged>,
     instance: wgpu::Instance,
+    /// Before `window`, so that it goes before the window's surface.
+    shortcuts: Option<ShortcutInhibitor>,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     session: Option<Session>,
@@ -103,9 +108,7 @@ struct App {
     buttons: u8,
     scroll: scroll::Steps,
     modifiers: ModifiersState,
-    /// Keysym sent for each held physical key, so releases match presses
-    /// even if modifiers changed in between.
-    pressed: HashMap<KeyCode, u32>,
+    keyboard: Keyboard,
     cursors: HashMap<u32, CustomCursor>,
 }
 
@@ -163,36 +166,39 @@ impl App {
     }
 
     fn key(&mut self, ev: &KeyEvent) {
-        let Some(s) = &self.session else { return };
         let PhysicalKey::Code(code) = ev.physical_key else { return };
-        let down = ev.state == ElementState::Pressed;
-        if !down {
-            if let Some(ks) = self.pressed.remove(&code) {
-                s.key(false, ks);
-            }
-            return;
-        }
-        let m = self.modifiers;
-        let shortcut = m.control_key() || m.alt_key() || m.super_key();
-        let logical = if shortcut { ev.key_without_modifiers() } else { ev.logical_key.clone() };
-        let Some(ks) = keymap::keysym(ev.physical_key, &logical, self.opts.swap_ctrl_cmd) else {
-            return;
+        let base = ev.key_without_modifiers();
+        let input = KeyInput {
+            code,
+            down: ev.state == ElementState::Pressed,
+            logical: &ev.logical_key,
+            base: &base,
+            text: ev.text.as_deref(),
+            mods: self.modifiers,
         };
-        if let Some(prev) = self.pressed.insert(code, ks)
-            && prev != ks {
-                s.key(false, prev);
+        let out = self.keyboard.key(&input);
+        self.send_keys(out);
+    }
+
+    fn send_keys(&mut self, out: Vec<Out>) {
+        for o in out {
+            match (o, &self.session) {
+                (Out::Down(ks), Some(s)) => s.key(true, ks),
+                (Out::Up(ks), Some(s)) => s.key(false, ks),
+                (Out::ToggleShortcuts, _) => match &mut self.shortcuts {
+                    Some(i) => i.toggle(),
+                    None => tracing::info!("Ctrl+Alt+Shift+Z: this compositor keeps its shortcuts"),
+                },
+                (_, None) => {}
             }
-        s.key(true, ks);
+        }
     }
 
     /// Releases everything we hold on the host, e.g. when focus is lost
     /// mid-shortcut and the release would never arrive.
     fn release_all(&mut self) {
-        if let Some(s) = &self.session {
-            for (_, ks) in self.pressed.drain() {
-                s.key(false, ks);
-            }
-        }
+        let out = self.keyboard.release_all();
+        self.send_keys(out);
         if self.buttons != 0 {
             self.buttons = 0;
             self.send_pointer(0);
@@ -266,7 +272,7 @@ impl App {
         self.retry_due = Some(Instant::now() + delay);
         // Input state belongs to the dead session; the host forgets held
         // keys and buttons with it.
-        self.pressed.clear();
+        self.keyboard.forget();
         self.buttons = 0;
         self.scroll = scroll::Steps::default();
         self.cursors.clear();
@@ -330,6 +336,7 @@ impl ApplicationHandler<Tagged> for App {
             Ok(r) => self.renderer = Some(r),
             Err(e) => return self.fail(el, format!("{e:#}")),
         }
+        self.shortcuts = ShortcutInhibitor::new(&window);
         self.window = Some(window);
         self.start_session();
     }
@@ -485,11 +492,13 @@ pub fn run(event_loop: &mut EventLoop<Tagged>, cfg: Config, opts: Options) -> Re
         event_loop.owned_display_handle(),
     )));
     let reconnect = opts.reconnect;
+    let keyboard = Keyboard::new(opts.swap_ctrl_cmd);
     let mut app = App {
         cfg,
         opts,
         proxy: event_loop.create_proxy(),
         instance,
+        shortcuts: None,
         window: None,
         renderer: None,
         session: None,
@@ -503,7 +512,7 @@ pub fn run(event_loop: &mut EventLoop<Tagged>, cfg: Config, opts: Options) -> Re
         buttons: 0,
         scroll: scroll::Steps::default(),
         modifiers: ModifiersState::empty(),
-        pressed: HashMap::new(),
+        keyboard,
         cursors: HashMap::new(),
     };
     event_loop.run_app_on_demand(&mut app)?;
