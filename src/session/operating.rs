@@ -19,11 +19,12 @@
 //! per line; see [`parse_command`]. For scripted tests, it also sends keys
 //! and pointer input to the Mac and asks for snapshots of the picture.
 
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::fmt;
 use std::io::{Error, ErrorKind, Read};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -361,12 +362,22 @@ fn run_command(shared: &Shared, control: &Control, fb: &Sender<Feedback>, pointe
 /// permissions, in a directory with the same rule, such as
 /// `$XDG_RUNTIME_DIR`.
 pub(super) fn open_fifo(path: &Path) -> std::io::Result<std::fs::File> {
-    let name = path.file_name().ok_or_else(|| Error::new(ErrorKind::InvalidInput, "the path has no file name"))?;
-    let name = CString::new(name.as_encoded_bytes()).map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
-    let dir_path = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    // Split at the last slash by hand: `Path::file_name` drops a trailing
+    // slash, and a writer cannot open `pippin.ctl/`.
+    let bytes = path.as_os_str().as_bytes();
+    let (dir_path, name) = match bytes.iter().rposition(|&b| b == b'/') {
+        Some(0) => (Path::new("/"), &bytes[1..]),
+        Some(i) => (Path::new(OsStr::from_bytes(&bytes[..i])), &bytes[i + 1..]),
+        None => (Path::new("."), bytes),
+    };
+    if name.is_empty() {
+        return Err(Error::new(ErrorKind::InvalidInput, "the path has no file name"));
+    }
+    let name = CString::new(name).map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
     // The FIFO is created and opened relative to this descriptor, so the
-    // checks hold for the directory that was checked.
-    let dir = std::fs::File::open(dir_path)?;
+    // checks hold for the directory that was checked. O_DIRECTORY refuses a
+    // parent FIFO instead of waiting for its writer.
+    let dir = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY).open(dir_path)?;
     // SAFETY: geteuid has no preconditions.
     let uid = unsafe { libc::geteuid() };
     only_for(uid, &dir.metadata()?).map_err(|why| {
@@ -710,6 +721,23 @@ mod tests {
         assert!(refusal(&path).starts_with(&want));
         // pippin creates nothing in a directory that it refuses.
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn refuses_a_path_with_a_trailing_slash() {
+        let dir = PrivateDir::new("fifo-slash-test");
+        let path = dir.join("pippin.ctl");
+        assert_eq!(refusal(&dir.0.join("pippin.ctl/")), "the path has no file name");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn refuses_a_fifo_as_the_directory_without_waiting() {
+        let dir = PrivateDir::new("fifo-parent-test");
+        let pipe = dir.join("pipe");
+        drop(open_fifo(&pipe).unwrap());
+        let e = open_fifo(&pipe.join("pippin.ctl")).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::ENOTDIR));
     }
 
     #[test]
