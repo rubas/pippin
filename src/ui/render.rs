@@ -374,14 +374,16 @@ impl Renderer {
         Some(Viewport { x: ((ww - w) / 2.0).floor(), y: ((wh - h) / 2.0).floor(), w, h })
     }
 
-    pub fn render(&mut self) {
+    /// Draws the canvas and presents it. False when the surface gave no
+    /// texture, so nothing new is on screen.
+    pub fn render(&mut self) -> bool {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.config);
-                return;
+                return false;
             }
-            _ => return,
+            _ => return false,
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
             format: Some(self.view_format),
@@ -410,5 +412,6 @@ impl Renderer {
         }
         self.queue.submit([enc.finish()]);
         self.queue.present(frame);
+        true
     }
 }
