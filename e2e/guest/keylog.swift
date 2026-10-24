@@ -27,15 +27,9 @@ func sourceID(_ source: TISInputSource) -> String {
 
 let wanted = CommandLine.arguments[2]
 let filter = [kTISPropertyInputSourceID: wanted] as CFDictionary
-// A layout that was just installed can be selected once the agent of the
-// input sources has started again.
-for _ in 0..<50 {
-  if let source = (TISCreateInputSourceList(filter, true)?.takeRetainedValue() as? [TISInputSource])?.first,
-    TISEnableInputSource(source) == noErr, TISSelectInputSource(source) == noErr
-  {
-    break
-  }
-  usleep(200_000)
+if let source = (TISCreateInputSourceList(filter, true).takeRetainedValue() as! [TISInputSource]).first {
+  TISEnableInputSource(source)
+  TISSelectInputSource(source)
 }
 write("source \(sourceID(TISCopyCurrentKeyboardLayoutInputSource().takeRetainedValue()))")
 

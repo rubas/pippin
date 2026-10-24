@@ -278,10 +278,15 @@ const NEO_TEXT = "[]{}\\/|@#$%&*<>=~ _…!?()-:;\"'+ ^a `a ´a ^ ` ´ âàá ê�
 const keyboard: Scenario = {
   about: "type Neo 2 text and press Command and Option, and see each reach a text view on a Mac with the Neo 2 layout",
   async run(ctx) {
+    // A session lists the layouts that were there when it logged in, so the VM
+    // starts again with the layout in place.
+    await ctx.guest.put("/tmp/neo.keylayout", await readFile(`'${NEO_LAYOUT}'`));
+    await ctx.guest.sh(`sudo -n install -m 644 /tmp/neo.keylayout '${NEO_LAYOUT}'`);
+    await ctx.guest.sh('{ sudo -n sh -c "sleep 1; shutdown -r now" >/dev/null 2>&1 & }');
+    await waitFor("the VM to go down", 60_000, async () => ((await ctx.guest.ok("true", 5_000)) ? undefined : true));
+    await ctx.guest.waitSsh(120_000);
+    await ctx.guest.waitDesktop(120_000);
     await connected(ctx, ["WindowServer", "screensharingd", "ScreensharingAgent"], false, async (session) => {
-      await ctx.guest.put("/tmp/neo.keylayout", await readFile(`'${NEO_LAYOUT}'`));
-      // The input sources of the session see a new layout once their agents start again.
-      await ctx.guest.sh(`sudo -n install -m 644 /tmp/neo.keylayout '${NEO_LAYOUT}' && killall TextInputMenuAgent TextInputSwitcher`);
       const log = await openTool(ctx, "keylog", [NEO]);
       const source = (await log()).find((l) => l.startsWith("source "));
       ctx.check("input source", source === `source ${NEO}`, source ?? "none");
