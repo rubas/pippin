@@ -18,8 +18,10 @@ const SHADER: &str = r#"
 @group(0) @binding(3) var samp: sampler;
 
 // The stream's colour: RGB = rows · (sample − offset); see Conversion.
+// Each column of `rows` holds one row of the matrix, so `yuv * rows` takes
+// one dot product per row.
 struct Conversion {
-    rows: array<vec4<f32>, 3>,
+    rows: mat3x3<f32>,
     offset: vec4<f32>,
 };
 @group(0) @binding(4) var<uniform> conv: Conversion;
@@ -51,7 +53,7 @@ fn rgb_at(i: Out) -> vec4<f32> {
         textureSample(u_tex, samp, i.uv)[u_ch],
         textureSample(v_tex, samp, i.uv)[v_ch],
     ) - conv.offset.xyz;
-    let rgb = vec3<f32>(dot(conv.rows[0].xyz, yuv), dot(conv.rows[1].xyz, yuv), dot(conv.rows[2].xyz, yuv));
+    let rgb = yuv * conv.rows;
     return vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }
 

@@ -70,12 +70,13 @@ impl Colour {
             Matrix::Bt2020 => (0.2627, 0.0593),
         };
         let kg = 1.0 - kr - kb;
-        // Scales of Y and Cb/Cr to 0..1 and −0.5..0.5, and the offsets of
-        // Y and Cb/Cr. Neutral chroma is 128 in both ranges.
-        let (y_scale, c_scale, y_offset, c_offset) = match self.range {
-            Range::Full => (1.0, 1.0, 0.0, 128.0 / 255.0),
-            Range::Limited => (255.0 / 219.0, 255.0 / 224.0, 16.0 / 255.0, 128.0 / 255.0),
+        // Scales of Y and Cb/Cr to 0..1 and −0.5..0.5, and the offset of Y.
+        // Neutral chroma is 128 in both ranges.
+        let (y_scale, c_scale, y_offset) = match self.range {
+            Range::Full => (1.0, 1.0, 0.0),
+            Range::Limited => (255.0 / 219.0, 255.0 / 224.0, 16.0 / 255.0),
         };
+        let c_offset = 128.0 / 255.0;
         Conversion {
             rows: [
                 [y_scale, 0.0, 2.0 * (1.0 - kr) * c_scale, 0.0],
