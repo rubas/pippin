@@ -2,7 +2,7 @@
 //! the host's virtual display sized to the window.
 
 pub mod dialog;
-mod keymap;
+pub(crate) mod keymap;
 mod reconnect;
 mod render;
 
@@ -340,6 +340,8 @@ impl ApplicationHandler<Tagged> for App {
             // A new render scale: same path as a resize (the host's layout
             // answer makes the session re-offer).
             Event::Reconfigure => self.send_resize(),
+            // The picture is on the GPU here; only --headless keeps it.
+            Event::Snapshot(path) => tracing::warn!("snapshot {}: only --headless takes snapshots", path.display()),
         }
     }
 

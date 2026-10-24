@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use anyhow::Result;
 use crossbeam_channel::Sender;
 
-use super::{Control, CursorShape, Event, Feedback, KeyframeCause, Shared};
+use super::{Control, CursorShape, DisplaySize, Event, Feedback, KeyframeCause, Shared};
 use crate::proto::clipboard::{self, Reassembler};
 use crate::proto::messages::{self, CursorRect, DisplayLayout, Rect};
 use crate::proto::offers::parse_answer;
@@ -199,6 +199,7 @@ impl ControlReader {
         }
         let changed = self.backing.is_some_and(|b| b != l.backing);
         self.backing = Some(l.backing);
+        *self.shared.display.lock() = Some(DisplaySize { points: l.scaled, pixels: l.backing });
         if changed {
             // The encoder stops after a geometry change until the media
             // session is offered again.

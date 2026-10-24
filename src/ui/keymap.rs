@@ -121,9 +121,66 @@ pub fn keysym(physical: PhysicalKey, logical: &Key, swap_ctrl_cmd: bool) -> Opti
     }
 }
 
+/// Keysym for a key name of the control FIFO: one character, a modifier
+/// (`cmd`, `ctrl`, `alt` or `opt`, `shift`, sent as the left key), or a named
+/// key (`return`, `esc`, `tab`, `space`, `backspace`, `delete`, `home`,
+/// `end`, `pageup`, `pagedown`, `left`, `right`, `up`, `down`, `f1` to
+/// `f20`).
+pub fn by_name(name: &str) -> Option<u32> {
+    let mut chars = name.chars();
+    if let (Some(c), None) = (chars.next(), chars.next()) {
+        return Some(char_keysym(c));
+    }
+    let modifier = match name {
+        "cmd" => Some(KeyCode::SuperLeft),
+        "ctrl" => Some(KeyCode::ControlLeft),
+        "alt" | "opt" => Some(KeyCode::AltLeft),
+        "shift" => Some(KeyCode::ShiftLeft),
+        _ => None,
+    };
+    if let Some(code) = modifier {
+        return modifier_keysym(code);
+    }
+    use NamedKey::*;
+    const F_KEYS: [NamedKey; 20] =
+        [F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20];
+    named_keysym(match name {
+        "return" | "enter" => Enter,
+        "esc" | "escape" => Escape,
+        "tab" => Tab,
+        "space" => Space,
+        "backspace" => Backspace,
+        "delete" => Delete,
+        "home" => Home,
+        "end" => End,
+        "pageup" => PageUp,
+        "pagedown" => PageDown,
+        "left" => ArrowLeft,
+        "right" => ArrowRight,
+        "up" => ArrowUp,
+        "down" => ArrowDown,
+        _ => *F_KEYS.get(name.strip_prefix('f')?.parse::<usize>().ok()?.checked_sub(1)?)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maps_key_names() {
+        assert_eq!(by_name("f"), Some(0x66));
+        assert_eq!(by_name("cmd"), Some(XK_SUPER_L));
+        assert_eq!(by_name("ctrl"), Some(XK_CONTROL_L));
+        assert_eq!(by_name("opt"), Some(0xffe9));
+        assert_eq!(by_name("return"), Some(0xff0d));
+        assert_eq!(by_name("esc"), Some(0xff1b));
+        assert_eq!(by_name("f1"), Some(0xffbe));
+        assert_eq!(by_name("f20"), Some(0xffd1));
+        for bad in ["f0", "f21", "fx", "command", ""] {
+            assert_eq!(by_name(bad), None, "{bad:?}");
+        }
+    }
 
     #[test]
     fn maps_keys() {

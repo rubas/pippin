@@ -16,7 +16,8 @@
 //!   and the new session offers the current operating point from the start.
 //!
 //! A debug control FIFO (`PIPPIN_CONTROL_FIFO=/path`) takes one command
-//! per line; see [`parse_command`].
+//! per line; see [`parse_command`]. For scripted tests, it also sends keys
+//! and pointer input to the Mac and asks for snapshots of the picture.
 
 use std::fmt;
 use std::io::Read;
@@ -28,10 +29,12 @@ use std::sync::Arc;
 use crossbeam_channel::Sender;
 use parking_lot::Mutex;
 
-use super::{Event, Feedback, KeyframeCause, Shared};
+use super::{Control, DisplaySize, Event, Feedback, KeyframeCause, Shared};
+use crate::proto::messages::{BTN_LEFT, BTN_RIGHT};
 use crate::proto::offers::OfferOptions;
 use crate::rtp::assembler::HoldMode;
 use crate::rtp::rtcp::Recovery;
+use crate::ui::keymap;
 
 /// Offered frame rate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -139,13 +142,26 @@ impl Lever {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     Set(Lever),
     /// Ask every tile for a keyframe now (e.g. to measure keyframe size).
     Keyframe,
     /// End the session and reconnect with the current operating point.
     Restart,
+    /// Press these keysyms in order, then release them in reverse order: a
+    /// shortcut such as `cmd+ctrl+f`.
+    Key(Vec<u32>),
+    /// Press and release the keysym of each character in turn.
+    Type(Vec<u32>),
+    /// Move the pointer to this point of the Mac display.
+    Pointer(u32, u32),
+    /// Press and release this button (an RFB button bit) at the pointer.
+    Click(u8),
+    /// Write the latest picture to this PNG file.
+    Snapshot(PathBuf),
+    /// End the session and exit.
+    Quit,
 }
 
 pub fn parse_on_off(s: &str) -> Result<bool, String> {
@@ -160,16 +176,31 @@ pub fn parse_on_off(s: &str) -> Result<bool, String> {
 /// `recovery fir|pli|fir+pli`, `hold auto|on|off`, `ltr on|off`,
 /// `after_loss idr|conceal`,
 /// `keyframe` or `restart` (which ends the session like a dropped connection,
-/// so it exits under `--no-reconnect`). Blank lines and `#` comments give `Ok(None)`.
+/// so it exits under `--no-reconnect`).
+///
+/// Input and output for scripted tests: `key <combo>` (key names joined by
+/// `+`, such as `cmd+ctrl+f`; see [`keymap::by_name`]), `type <text>` (the
+/// rest of the line), `pointer <x> <y>` (in points of the Mac display),
+/// `click [left|right]`, `snapshot <path.png>` and `quit`.
+///
+/// Blank lines and `#` comments give `Ok(None)`.
 pub fn parse_command(line: &str) -> Result<Option<Command>, String> {
-    let line = line.split('#').next().unwrap_or_default().trim();
-    let mut words = line.split_whitespace();
-    let Some(cmd) = words.next() else { return Ok(None) };
-    let arg = words.next();
-    if words.next().is_some() {
-        return Err(format!("too many arguments: {line:?}"));
+    let line = line.trim_end_matches(['\r', '\n']);
+    // The text keeps its spaces and any `#`.
+    if let Some(text) = line.trim_start().strip_prefix("type ") {
+        if text.is_empty() || text.chars().any(char::is_control) {
+            return Err("type needs printable text".into());
+        }
+        return Ok(Some(Command::Type(text.chars().map(keymap::char_keysym).collect())));
     }
-    let need = |what: &str| arg.ok_or_else(|| format!("{cmd} needs {what}"));
+    let line = line.split('#').next().unwrap_or_default().trim();
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let Some((&cmd, args)) = words.split_first() else { return Ok(None) };
+    let need = |what: &str| match args {
+        [arg] => Ok(*arg),
+        [] => Err(format!("{cmd} needs {what}")),
+        _ => Err(format!("too many arguments: {line:?}")),
+    };
     let lever = match cmd {
         "render_scale" => match need("1 or 0.5")?.parse::<f64>() {
             Ok(v) if v == 1.0 || v == 0.5 => Lever::RenderScale(v),
@@ -193,12 +224,38 @@ pub fn parse_command(line: &str) -> Result<Option<Command>, String> {
             let v = need("idr or conceal")?;
             Lever::AfterLoss(AfterLoss::parse(v).ok_or_else(|| format!("unknown after_loss {v:?}"))?)
         }
-        "keyframe" | "restart" if arg.is_some() => return Err(format!("{cmd} takes no argument")),
+        "keyframe" | "restart" | "quit" if !args.is_empty() => return Err(format!("{cmd} takes no argument")),
         "keyframe" => return Ok(Some(Command::Keyframe)),
         "restart" => return Ok(Some(Command::Restart)),
+        "quit" => return Ok(Some(Command::Quit)),
+        "key" => {
+            let keys = need("a key such as cmd+q")?.split('+').map(|k| keymap::by_name(k).ok_or_else(|| format!("unknown key {k:?}")));
+            return Ok(Some(Command::Key(keys.collect::<Result<_, _>>()?)));
+        }
+        "type" => return Err("type needs printable text".into()),
+        "pointer" => {
+            let [x, y] = args else { return Err("pointer needs x and y in points".into()) };
+            let point = |v: &str| v.parse().map_err(|_| format!("pointer needs whole points, got {v:?}"));
+            return Ok(Some(Command::Pointer(point(x)?, point(y)?)));
+        }
+        "click" => {
+            return Ok(Some(Command::Click(match args {
+                [] | ["left"] => BTN_LEFT,
+                ["right"] => BTN_RIGHT,
+                _ => return Err(format!("click takes left or right, got {args:?}")),
+            })));
+        }
+        "snapshot" => return Ok(Some(Command::Snapshot(need("a path")?.into()))),
         _ => return Err(format!("unknown command {cmd:?}")),
     };
     Ok(Some(Command::Set(lever)))
+}
+
+/// A point of the Mac display → the stream pixel under it, the pointer's
+/// coordinate space, clamped to the display.
+fn to_pixels((x, y): (u32, u32), d: DisplaySize) -> (u16, u16) {
+    let scale = |v: u32, pt: u16, px: u16| (v as u64 * px as u64 / pt.max(1) as u64).min(px.saturating_sub(1) as u64) as u16;
+    (scale(x, d.points.0, d.pixels.0), scale(y, d.points.1, d.pixels.1))
 }
 
 /// Moves the session to `new`: fast levers are read where they're used, so
@@ -225,7 +282,9 @@ pub(super) fn apply(shared: &Shared, fb: &Sender<Feedback>, new: OperatingPoint)
     }
 }
 
-fn run_command(shared: &Shared, fb: &Sender<Feedback>, cmd: Command) {
+/// Runs one command. `pointer` is where the FIFO's pointer is, in stream
+/// pixels, once a `pointer` command placed it.
+fn run_command(shared: &Shared, control: &Control, fb: &Sender<Feedback>, pointer: &mut Option<(u16, u16)>, cmd: Command) {
     match cmd {
         Command::Set(lever) => {
             let mut op = shared.op();
@@ -239,6 +298,41 @@ fn run_command(shared: &Shared, fb: &Sender<Feedback>, cmd: Command) {
         Command::Restart => {
             tracing::info!("control: restarting the session");
             shared.sink.emit(Event::Lost("restart requested on the control FIFO".into()));
+        }
+        // Input is never logged: `type` may carry a password.
+        Command::Key(keys) => {
+            for &k in &keys {
+                control.key(true, k);
+            }
+            for &k in keys.iter().rev() {
+                control.key(false, k);
+            }
+        }
+        Command::Type(keys) => {
+            for k in keys {
+                control.key(true, k);
+                control.key(false, k);
+            }
+        }
+        Command::Pointer(x, y) => {
+            let Some(display) = *shared.display.lock() else {
+                return tracing::warn!("control FIFO: no display layout yet, so pointer has no position to go to");
+            };
+            let (px, py) = to_pixels((x, y), display);
+            *pointer = Some((px, py));
+            control.pointer(0, px, py);
+        }
+        Command::Click(button) => {
+            let Some((x, y)) = *pointer else {
+                return tracing::warn!("control FIFO: click needs a pointer command first");
+            };
+            control.pointer(button, x, y);
+            control.pointer(0, x, y);
+        }
+        Command::Snapshot(path) => shared.sink.emit(Event::Snapshot(path)),
+        Command::Quit => {
+            tracing::info!("control: quitting");
+            shared.sink.emit(Event::Closed(None));
         }
     }
 }
@@ -262,7 +356,7 @@ fn open_fifo(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// Reads control commands from the FIFO at `path` until the session stops.
-pub(super) fn control_fifo(shared: Arc<Shared>, path: PathBuf, fb: Sender<Feedback>) {
+pub(super) fn control_fifo(shared: Arc<Shared>, control: Arc<Control>, path: PathBuf, fb: Sender<Feedback>) {
     let mut f = match open_fifo(&path) {
         Ok(f) => f,
         Err(e) => {
@@ -272,6 +366,7 @@ pub(super) fn control_fifo(shared: Arc<Shared>, path: PathBuf, fb: Sender<Feedba
     };
     tracing::info!("reading control commands from {}", path.display());
     let mut pending = Vec::new();
+    let mut pointer = None;
     let mut buf = [0u8; 1024];
     while !shared.stopped() {
         let mut pfd = libc::pollfd { fd: f.as_raw_fd(), events: libc::POLLIN, revents: 0 };
@@ -290,7 +385,7 @@ pub(super) fn control_fifo(shared: Arc<Shared>, path: PathBuf, fb: Sender<Feedba
         while let Some(end) = pending.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = pending.drain(..=end).collect();
             match parse_command(&String::from_utf8_lossy(&line)) {
-                Ok(Some(cmd)) => run_command(&shared, &fb, cmd),
+                Ok(Some(cmd)) => run_command(&shared, &control, &fb, &mut pointer, cmd),
                 Ok(None) => {}
                 Err(e) => tracing::warn!("control FIFO: {e}"),
             }
@@ -345,9 +440,49 @@ mod tests {
             "restart now",
             "fps 30 60",
             "warp 9",
+            "key",
+            "key cmd+",
+            "key command+q",
+            "key cmd+q now",
+            "type",
+            "type a\tb",
+            "pointer 10",
+            "pointer 10 -5",
+            "pointer 1.5 2",
+            "click middle",
+            "snapshot",
+            "snapshot a.png b.png",
+            "quit now",
         ] {
             assert!(parse_command(bad).is_err(), "{bad:?} accepted");
         }
+    }
+
+    #[test]
+    fn parses_input_and_snapshot_commands() {
+        let cmd = |l| parse_command(l).unwrap().unwrap();
+        assert_eq!(cmd("key cmd+ctrl+f"), Command::Key(vec![0xffeb, 0xffe3, 0x66]));
+        assert_eq!(cmd("key return\n"), Command::Key(vec![0xff0d]));
+        assert_eq!(cmd("key esc"), Command::Key(vec![0xff1b]));
+        // The rest of the line, spaces and `#` included.
+        assert_eq!(cmd("type a b#é\r\n"), Command::Type(vec![0x61, 0x20, 0x62, 0x23, 0xe9]));
+        assert_eq!(cmd("pointer 1280 720"), Command::Pointer(1280, 720));
+        assert_eq!(cmd("click"), Command::Click(BTN_LEFT));
+        assert_eq!(cmd("click left"), Command::Click(BTN_LEFT));
+        assert_eq!(cmd("click right"), Command::Click(BTN_RIGHT));
+        assert_eq!(cmd("snapshot /tmp/run/1.png"), Command::Snapshot("/tmp/run/1.png".into()));
+        assert_eq!(cmd("quit"), Command::Quit);
+    }
+
+    #[test]
+    fn places_points_on_stream_pixels() {
+        let retina = DisplaySize { points: (1280, 720), pixels: (2560, 1440) };
+        assert_eq!(to_pixels((0, 0), retina), (0, 0));
+        assert_eq!(to_pixels((640, 360), retina), (1280, 720));
+        // Past the edge stays on the last pixel.
+        assert_eq!(to_pixels((5000, 720), retina), (2559, 1439));
+        let flat = DisplaySize { points: (2560, 1440), pixels: (2560, 1440) };
+        assert_eq!(to_pixels((100, 200), flat), (100, 200));
     }
 
     #[test]
