@@ -23,7 +23,8 @@
 //! * `video_pps`, `video_bytes_ps`: authenticated video SRTP packets and
 //!   their size as received, every SSRC (including ones not adopted). The
 //!   size is the UDP payload: RTP header, encrypted payload and SRTP auth
-//!   tag, without IP and UDP headers. Undecryptable packets are left out.
+//!   tag, without IP and UDP headers. Undecryptable and replayed packets
+//!   are left out, so a duplicate the network made counts once.
 //! * `tiles`: per adopted tile, `loss_pct` (packets missing over packets
 //!   expected in the interval, from the RFC 3550 receiver statistics; a
 //!   retransmission or late packet that fills a hole counts as received,

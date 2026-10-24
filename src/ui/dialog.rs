@@ -44,17 +44,7 @@ impl Fields {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn debug_hides_password() {
-        let f = Fields { host: "mac".into(), user: "alice".into(), password: "hunter2".into(), save: false };
-        let s = format!("{f:?}");
-        assert!(!s.contains("hunter2") && s.contains("alice"), "{s}");
-    }
-}
+type HasSaved = Box<dyn Fn(&str, &str) -> bool>;
 
 struct Gpu {
     window: Arc<Window>,
@@ -78,7 +68,7 @@ struct Dialog {
     failure: Option<anyhow::Error>,
     repaint_at: Option<Instant>,
     /// Asks whether a password is saved for (host, user).
-    has_saved: Box<dyn Fn(&str, &str) -> bool>,
+    has_saved: HasSaved,
     /// Answer for the host and user as of the last lookup. Refreshed when
     /// those fields lose focus, not per frame, since it's a D-Bus call.
     saved: bool,
@@ -370,4 +360,16 @@ pub fn run(
         f.user = f.user.trim().to_owned();
         f
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_hides_password() {
+        let f = Fields { host: "mac".into(), user: "alice".into(), password: "hunter2".into(), save: false };
+        let s = format!("{f:?}");
+        assert!(!s.contains("hunter2") && s.contains("alice"), "{s}");
+    }
 }

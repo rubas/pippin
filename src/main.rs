@@ -9,11 +9,13 @@ mod audio;
 mod clipboard;
 mod credentials;
 mod errors;
+mod headless;
 #[cfg(test)]
 mod interop_tests;
 mod proto;
 mod rtp;
 mod session;
+mod snapshot;
 mod ui;
 mod video;
 
@@ -44,6 +46,12 @@ struct Cli {
     /// isn't a terminal (e.g. launched from a .desktop file).
     #[arg(long)]
     dialog: bool,
+    /// Run without a window, for scripted tests: decode the video and show
+    /// nothing. --size sets the Mac display in points. No clipboard sync, no
+    /// sound, and no reconnect. PIPPIN_CONTROL_FIFO sends input and takes
+    /// snapshots.
+    #[arg(long, conflicts_with = "dialog")]
+    headless: bool,
     /// Account password. Otherwise taken from the keyring or prompted for.
     #[arg(long, env = "PIPPIN_PASSWORD", hide_env_values = true)]
     password: Option<String>,
@@ -62,11 +70,12 @@ struct Cli {
     /// Share the console user's screen, or open a separate login session.
     #[arg(long, value_enum, default_value_t = SessionMode::Share)]
     session: SessionMode,
-    /// Initial window size in logical pixels, e.g. 1600x900.
+    /// Initial window size in logical pixels, e.g. 1600x900. With
+    /// --headless, the size of the Mac display in points, e.g. 2560x1440.
     #[arg(long, value_parser = parse_size, default_value = "1600x900")]
     size: (u32, u32),
     /// Backing scale for the virtual display (1 = flat, 2 = Retina).
-    /// Defaults to 2 on HiDPI screens, else 1.
+    /// Defaults to 2 on HiDPI screens, else 1, and to 1 with --headless.
     #[arg(long)]
     scale: Option<f64>,
     /// Largest virtual display to ask the Mac for, in pixels, e.g.
@@ -156,14 +165,16 @@ fn resolve_ipv4(host: &str, port: u16) -> Result<Ipv4Addr> {
 }
 
 fn main() -> std::process::ExitCode {
-    match run() {
+    let cli = Cli::parse();
+    let headless = cli.headless;
+    match run(cli) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             // Session failures arrive already classified; full chains for
             // everything are at debug level.
             tracing::debug!("{e:?}");
             eprintln!("pippin: {e:#}");
-            if !std::io::stdin().is_terminal() {
+            if !headless && !std::io::stdin().is_terminal() {
                 // Launched from a desktop entry: stderr goes nowhere, so try
                 // a notification. Missing notify-send is fine.
                 let _ = std::process::Command::new("notify-send")
@@ -178,8 +189,7 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-fn run() -> Result<()> {
-    let cli = Cli::parse();
+fn run(cli: Cli) -> Result<()> {
     let default_filter = match cli.verbose {
         0 => "pippin=info,wgpu=error,naga=error",
         1 => "pippin=debug,wgpu=warn",
@@ -229,7 +239,8 @@ fn run() -> Result<()> {
             &account,
         )?;
     }
-    let mut event_loop = ui::event_loop()?;
+    // Headless needs no display server, and opens no connection to one.
+    let mut event_loop = if cli.headless { None } else { Some(ui::event_loop()?) };
     let mut save = cli.save_password;
     let mode = credentials::choose(cli.dialog, target.is_some(), found.is_some(), tty);
     let (host, user, password, source) = match (mode, target, found) {
@@ -246,10 +257,23 @@ fn run() -> Result<()> {
             }
             (h, u, p, credentials::Source::Prompt)
         }
-        (credentials::Mode::Dialog, ..) => return dialog_loop(&mut event_loop, &cli, &store),
+        (credentials::Mode::Dialog, ..) => match event_loop.as_mut() {
+            Some(event_loop) => return dialog_loop(event_loop, &cli, &store),
+            None => bail!(
+                "--headless needs the host, --user and a password (--password, --password-stdin, \
+                 PIPPIN_PASSWORD or the keyring)"
+            ),
+        },
         _ => bail!("the host and --user are required (or use --dialog)"),
     };
-    connect(&mut event_loop, &cli, &store, &host, &user, password, source, save, false).map(drop)
+    let viewer = event_loop.as_mut().map_or(Viewer::Headless, Viewer::Window);
+    connect(viewer, &cli, &store, &host, &user, password, source, save, false).map(drop)
+}
+
+/// Where a session shows its picture.
+enum Viewer<'a> {
+    Window(&'a mut winit::event_loop::EventLoop<ui::Tagged>),
+    Headless,
 }
 
 /// Shows the connect dialog until a session runs or the user cancels; any
@@ -293,7 +317,7 @@ fn dialog_loop(
             fields = f;
             continue;
         };
-        match connect(event_loop, cli, store, &f.host, &f.user, password, source, f.save, true)? {
+        match connect(Viewer::Window(event_loop), cli, store, &f.host, &f.user, password, source, f.save, true)? {
             Outcome::Done => return Ok(()),
             Outcome::Retry { msg, wrong_password } => {
                 error = Some(msg);
@@ -315,7 +339,7 @@ enum Outcome {
 /// `Retry` so the dialog can show it and ask again.
 #[allow(clippy::too_many_arguments)]
 fn connect(
-    event_loop: &mut winit::event_loop::EventLoop<ui::Tagged>,
+    viewer: Viewer,
     cli: &Cli,
     store: &Arc<dyn credentials::Store>,
     host_name: &str,
@@ -349,7 +373,8 @@ fn connect(
             credentials::after_auth(store.as_ref(), &account, &password, source, ok, save, || false);
         })
     };
-    let audio = if cli.no_audio {
+    // Headless runs on a machine where someone else may be listening.
+    let audio = if cli.no_audio || cli.headless {
         None
     } else {
         audio::Player::new()
@@ -382,9 +407,15 @@ fn connect(
         })),
         stats_json: cli.stats_json.clone(),
         // Debug only: switch operating-point levers mid-session by writing
-        // lines such as `fps 30` or `hold off` to this FIFO.
+        // lines such as `fps 30` or `hold off` to this FIFO, or send input.
         control_fifo: std::env::var_os("PIPPIN_CONTROL_FIFO").map(PathBuf::from),
         audio: audio.clone(),
+        // The local clipboard belongs to whoever sits at this machine.
+        clipboard: !cli.headless,
+    };
+    let event_loop = match viewer {
+        Viewer::Window(event_loop) => event_loop,
+        Viewer::Headless => return headless::run(cfg, cli.size, cli.scale.unwrap_or(1.0)).map(|()| Outcome::Done),
     };
     let opts = ui::Options {
         title: format!("{host_name} — pippin"),

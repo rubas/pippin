@@ -62,12 +62,12 @@ fn fs_dim(i: Out) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// Each layout with the texture channels holding Y, U and V.
-const LAYOUTS: [(Layout, [f64; 3]); 3] =
-    [(Layout::Planar, [0.0, 0.0, 0.0]), (Layout::SemiPlanar, [0.0, 0.0, 1.0]), (Layout::Vuyx, [2.0, 1.0, 0.0])];
+/// One pair of pipelines per layout, as each reads Y, U and V from other
+/// texture channels.
+const LAYOUTS: [Layout; 3] = [Layout::Planar, Layout::SemiPlanar, Layout::Vuyx];
 
 fn layout_index(layout: Layout) -> usize {
-    LAYOUTS.iter().position(|(l, _)| *l == layout).unwrap()
+    LAYOUTS.iter().position(|l| *l == layout).unwrap()
 }
 
 struct Planes {
@@ -187,7 +187,7 @@ impl Renderer {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let make_pipeline = |fs, ch: [f64; 3]| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let make_pipeline = |fs, ch: [u32; 3]| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(fs),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
@@ -203,7 +203,7 @@ impl Renderer {
                 module: &shader,
                 entry_point: Some(fs),
                 compilation_options: wgpu::PipelineCompilationOptions {
-                    constants: &[("y_ch", ch[0]), ("u_ch", ch[1]), ("v_ch", ch[2])],
+                    constants: &[("y_ch", ch[0].into()), ("u_ch", ch[1].into()), ("v_ch", ch[2].into())],
                     ..Default::default()
                 },
                 targets: &[Some(view_format.into())],
@@ -211,7 +211,8 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
-        let pipelines = LAYOUTS.iter().map(|&(_, ch)| (make_pipeline("fs", ch), make_pipeline("fs_dim", ch))).collect();
+        let pipelines =
+            LAYOUTS.iter().map(|l| (make_pipeline("fs", l.channels()), make_pipeline("fs_dim", l.channels()))).collect();
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("planes"),
             mag_filter: wgpu::FilterMode::Linear,

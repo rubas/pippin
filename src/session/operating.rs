@@ -16,7 +16,8 @@
 //!   and the new session offers the current operating point from the start.
 //!
 //! A debug control FIFO (`PIPPIN_CONTROL_FIFO=/path`) takes one command
-//! per line; see [`parse_command`].
+//! per line; see [`parse_command`]. For scripted tests, it also sends keys
+//! and pointer input to the Mac and asks for snapshots of the picture.
 
 use std::fmt;
 use std::io::Read;
@@ -28,10 +29,12 @@ use std::sync::Arc;
 use crossbeam_channel::Sender;
 use parking_lot::Mutex;
 
-use super::{Event, Feedback, KeyframeCause, Shared};
+use super::{Control, DisplaySize, Event, Feedback, KeyframeCause, Shared};
+use crate::proto::messages::{BTN_LEFT, BTN_RIGHT};
 use crate::proto::offers::OfferOptions;
 use crate::rtp::assembler::HoldMode;
 use crate::rtp::rtcp::Recovery;
+use crate::ui::keymap;
 
 /// Offered frame rate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -139,13 +142,26 @@ impl Lever {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     Set(Lever),
     /// Ask every tile for a keyframe now (e.g. to measure keyframe size).
     Keyframe,
     /// End the session and reconnect with the current operating point.
     Restart,
+    /// Press these keysyms in order, then release them in reverse order: a
+    /// shortcut such as `cmd+ctrl+f`.
+    Key(Vec<u32>),
+    /// Press and release the keysym of each character in turn.
+    Type(Vec<u32>),
+    /// Move the pointer to this point of the Mac display.
+    Pointer(u32, u32),
+    /// Press and release this button (an RFB button bit) at the pointer.
+    Click(u8),
+    /// Write the latest picture to this PNG file.
+    Snapshot(PathBuf),
+    /// End the session and exit.
+    Quit,
 }
 
 pub fn parse_on_off(s: &str) -> Result<bool, String> {
@@ -160,16 +176,35 @@ pub fn parse_on_off(s: &str) -> Result<bool, String> {
 /// `recovery fir|pli|fir+pli`, `hold auto|on|off`, `ltr on|off`,
 /// `after_loss idr|conceal`,
 /// `keyframe` or `restart` (which ends the session like a dropped connection,
-/// so it exits under `--no-reconnect`). Blank lines and `#` comments give `Ok(None)`.
+/// so it exits under `--no-reconnect`).
+///
+/// Input and output for scripted tests: `key <combo>` (key names joined by
+/// `+`, such as `cmd+ctrl+f`; see [`keymap::by_name`]), `type <text>` (the
+/// rest of the line), `pointer <x> <y>` (in points of the Mac display),
+/// `click [left|right]`, `snapshot <path.png>` and `quit`.
+///
+/// Blank lines and lines that start with `#` give `Ok(None)`. A `#` later
+/// in a line is part of it, as in `snapshot /tmp/a#1.png`.
 pub fn parse_command(line: &str) -> Result<Option<Command>, String> {
-    let line = line.split('#').next().unwrap_or_default().trim();
-    let mut words = line.split_whitespace();
-    let Some(cmd) = words.next() else { return Ok(None) };
-    let arg = words.next();
-    if words.next().is_some() {
-        return Err(format!("too many arguments: {line:?}"));
+    let line = line.trim_end_matches(['\r', '\n']);
+    // The text keeps its spaces.
+    if let Some(text) = line.trim_start().strip_prefix("type ") {
+        if text.is_empty() || text.chars().any(char::is_control) {
+            return Err("type needs printable text".into());
+        }
+        return Ok(Some(Command::Type(text.chars().map(keymap::char_keysym).collect())));
     }
-    let need = |what: &str| arg.ok_or_else(|| format!("{cmd} needs {what}"));
+    let line = line.trim();
+    if line.starts_with('#') {
+        return Ok(None);
+    }
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let Some((&cmd, args)) = words.split_first() else { return Ok(None) };
+    let need = |what: &str| match args {
+        [arg] => Ok(*arg),
+        [] => Err(format!("{cmd} needs {what}")),
+        _ => Err(format!("too many arguments: {line:?}")),
+    };
     let lever = match cmd {
         "render_scale" => match need("1 or 0.5")?.parse::<f64>() {
             Ok(v) if v == 1.0 || v == 0.5 => Lever::RenderScale(v),
@@ -193,12 +228,38 @@ pub fn parse_command(line: &str) -> Result<Option<Command>, String> {
             let v = need("idr or conceal")?;
             Lever::AfterLoss(AfterLoss::parse(v).ok_or_else(|| format!("unknown after_loss {v:?}"))?)
         }
-        "keyframe" | "restart" if arg.is_some() => return Err(format!("{cmd} takes no argument")),
+        "keyframe" | "restart" | "quit" if !args.is_empty() => return Err(format!("{cmd} takes no argument")),
         "keyframe" => return Ok(Some(Command::Keyframe)),
         "restart" => return Ok(Some(Command::Restart)),
+        "quit" => return Ok(Some(Command::Quit)),
+        "key" => {
+            let keys = need("a key such as cmd+q")?.split('+').map(|k| keymap::by_name(k).ok_or_else(|| format!("unknown key {k:?}")));
+            return Ok(Some(Command::Key(keys.collect::<Result<_, _>>()?)));
+        }
+        "type" => return Err("type needs printable text".into()),
+        "pointer" => {
+            let [x, y] = args else { return Err("pointer needs x and y in points".into()) };
+            let point = |v: &str| v.parse().map_err(|_| format!("pointer needs whole points, got {v:?}"));
+            return Ok(Some(Command::Pointer(point(x)?, point(y)?)));
+        }
+        "click" => {
+            return Ok(Some(Command::Click(match args {
+                [] | ["left"] => BTN_LEFT,
+                ["right"] => BTN_RIGHT,
+                _ => return Err(format!("click takes left or right, got {args:?}")),
+            })));
+        }
+        "snapshot" => return Ok(Some(Command::Snapshot(need("a path")?.into()))),
         _ => return Err(format!("unknown command {cmd:?}")),
     };
     Ok(Some(Command::Set(lever)))
+}
+
+/// A point of the Mac display → the stream pixel under it, the pointer's
+/// coordinate space, clamped to the display.
+fn to_pixels((x, y): (u32, u32), d: DisplaySize) -> (u16, u16) {
+    let scale = |v: u32, pt: u16, px: u16| (v as u64 * px as u64 / pt.max(1) as u64).min(px.saturating_sub(1) as u64) as u16;
+    (scale(x, d.points.0, d.pixels.0), scale(y, d.points.1, d.pixels.1))
 }
 
 /// Moves the session to `new`: fast levers are read where they're used, so
@@ -225,7 +286,18 @@ pub(super) fn apply(shared: &Shared, fb: &Sender<Feedback>, new: OperatingPoint)
     }
 }
 
-fn run_command(shared: &Shared, fb: &Sender<Feedback>, cmd: Command) {
+/// Where the FIFO's pointer is in stream pixels. The pointer stays in
+/// points, so a click after a change of the backing scale lands on the
+/// same point of the Mac display.
+fn pointer_pixels(at: Option<(u32, u32)>, display: Option<DisplaySize>) -> Result<(u16, u16), &'static str> {
+    let at = at.ok_or("click needs a pointer command first")?;
+    let display = display.ok_or("no display layout yet, so the pointer has no position")?;
+    Ok(to_pixels(at, display))
+}
+
+/// Runs one command. `pointer` is where the FIFO's pointer is, in points,
+/// once a `pointer` command placed it.
+fn run_command(shared: &Shared, control: &Control, fb: &Sender<Feedback>, pointer: &mut Option<(u32, u32)>, cmd: Command) {
     match cmd {
         Command::Set(lever) => {
             let mut op = shared.op();
@@ -240,10 +312,45 @@ fn run_command(shared: &Shared, fb: &Sender<Feedback>, cmd: Command) {
             tracing::info!("control: restarting the session");
             shared.sink.emit(Event::Lost("restart requested on the control FIFO".into()));
         }
+        // Input is never logged: `type` may carry a password.
+        Command::Key(keys) => {
+            for &k in &keys {
+                control.key(true, k);
+            }
+            for &k in keys.iter().rev() {
+                control.key(false, k);
+            }
+        }
+        Command::Type(keys) => {
+            for k in keys {
+                control.key(true, k);
+                control.key(false, k);
+            }
+        }
+        Command::Pointer(x, y) => {
+            *pointer = Some((x, y));
+            match pointer_pixels(*pointer, *shared.display.lock()) {
+                Ok((px, py)) => control.pointer(0, px, py),
+                Err(e) => tracing::warn!("control FIFO: {e}"),
+            }
+        }
+        Command::Click(button) => match pointer_pixels(*pointer, *shared.display.lock()) {
+            Ok((x, y)) => {
+                control.pointer(button, x, y);
+                control.pointer(0, x, y);
+            }
+            Err(e) => tracing::warn!("control FIFO: {e}"),
+        },
+        Command::Snapshot(path) => shared.sink.emit(Event::Snapshot(path)),
+        Command::Quit => {
+            tracing::info!("control: quitting");
+            shared.sink.emit(Event::Closed(None));
+        }
     }
 }
 
-fn open_fifo(path: &Path) -> std::io::Result<std::fs::File> {
+/// Creates the FIFO at `path` if it is missing, and opens it.
+pub(super) fn open_fifo(path: &Path) -> std::io::Result<std::fs::File> {
     if !path.exists() {
         let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -261,17 +368,43 @@ fn open_fifo(path: &Path) -> std::io::Result<std::fs::File> {
     Ok(f)
 }
 
-/// Reads control commands from the FIFO at `path` until the session stops.
-pub(super) fn control_fifo(shared: Arc<Shared>, path: PathBuf, fb: Sender<Feedback>) {
-    let mut f = match open_fifo(&path) {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!("PIPPIN_CONTROL_FIFO {}: {e}", path.display());
-            return;
+/// The longest control line. A longer one is dropped up to its newline.
+const MAX_LINE: usize = 4096;
+
+/// Splits the bytes read from the FIFO into lines.
+#[derive(Default)]
+struct Lines {
+    buf: Vec<u8>,
+    /// The current line went past [`MAX_LINE`].
+    overlong: bool,
+}
+
+impl Lines {
+    /// Adds `bytes` and returns the lines they completed, `None` for each
+    /// line that was too long.
+    fn push(&mut self, bytes: &[u8]) -> Vec<Option<String>> {
+        let mut lines = Vec::new();
+        for &b in bytes {
+            if b == b'\n' {
+                lines.push((!self.overlong).then(|| String::from_utf8_lossy(&self.buf).into_owned()));
+                self.buf.clear();
+                self.overlong = false;
+            } else if self.buf.len() < MAX_LINE && !self.overlong {
+                self.buf.push(b);
+            } else {
+                self.buf.clear();
+                self.overlong = true;
+            }
         }
-    };
-    tracing::info!("reading control commands from {}", path.display());
-    let mut pending = Vec::new();
+        lines
+    }
+}
+
+/// Reads control commands from the FIFO until the session stops or a
+/// `quit` arrives.
+pub(super) fn control_fifo(shared: Arc<Shared>, control: Arc<Control>, mut f: std::fs::File, fb: Sender<Feedback>) {
+    let mut lines = Lines::default();
+    let mut pointer = None;
     let mut buf = [0u8; 1024];
     while !shared.stopped() {
         let mut pfd = libc::pollfd { fd: f.as_raw_fd(), events: libc::POLLIN, revents: 0 };
@@ -279,24 +412,29 @@ pub(super) fn control_fifo(shared: Arc<Shared>, path: PathBuf, fb: Sender<Feedba
         if unsafe { libc::poll(&mut pfd, 1, 200) } <= 0 {
             continue;
         }
-        match f.read(&mut buf) {
-            Ok(n) => pending.extend_from_slice(&buf[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::Interrupted => {}
+        let n = match f.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::Interrupted => 0,
             Err(e) => {
                 tracing::warn!("control FIFO: {e}");
                 return;
             }
-        }
-        while let Some(end) = pending.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = pending.drain(..=end).collect();
-            match parse_command(&String::from_utf8_lossy(&line)) {
-                Ok(Some(cmd)) => run_command(&shared, &fb, cmd),
+        };
+        for line in lines.push(&buf[..n]) {
+            // Never log the line: `type` may carry a password.
+            let Some(line) = line else {
+                tracing::warn!("control FIFO: dropped a line longer than {MAX_LINE} bytes");
+                continue;
+            };
+            match parse_command(&line) {
+                Ok(Some(Command::Quit)) => {
+                    run_command(&shared, &control, &fb, &mut pointer, Command::Quit);
+                    return;
+                }
+                Ok(Some(cmd)) => run_command(&shared, &control, &fb, &mut pointer, cmd),
                 Ok(None) => {}
                 Err(e) => tracing::warn!("control FIFO: {e}"),
             }
-        }
-        if pending.len() > 4096 {
-            pending.clear();
         }
     }
 }
@@ -320,7 +458,7 @@ mod tests {
         assert_eq!(parse_command("recovery fir+pli"), set(Lever::Recovery(Recovery::FirPli)));
         assert_eq!(parse_command("recovery fir"), set(Lever::Recovery(Recovery::Fir)));
         assert_eq!(parse_command("hold off"), set(Lever::Hold(HoldMode::Off)));
-        assert_eq!(parse_command("hold auto # comment"), set(Lever::Hold(HoldMode::Auto)));
+        assert_eq!(parse_command("hold auto"), set(Lever::Hold(HoldMode::Auto)));
         assert_eq!(parse_command("ltr off"), set(Lever::Ltr(false)));
         assert_eq!(parse_command("after_loss conceal"), set(Lever::AfterLoss(AfterLoss::Conceal)));
         assert_eq!(parse_command("after_loss idr"), set(Lever::AfterLoss(AfterLoss::Idr)));
@@ -345,9 +483,144 @@ mod tests {
             "restart now",
             "fps 30 60",
             "warp 9",
+            "key",
+            "key cmd+",
+            "key command+q",
+            "key cmd+q now",
+            "type",
+            "type a\tb",
+            "pointer 10",
+            "pointer 10 -5",
+            "pointer 1.5 2",
+            "click middle",
+            "snapshot",
+            "snapshot a.png b.png",
+            "quit now",
+            // Only a whole line is a comment.
+            "hold auto # comment",
         ] {
             assert!(parse_command(bad).is_err(), "{bad:?} accepted");
         }
+    }
+
+    #[test]
+    fn parses_input_and_snapshot_commands() {
+        let cmd = |l| parse_command(l).unwrap().unwrap();
+        assert_eq!(cmd("key cmd+ctrl+f"), Command::Key(vec![0xffeb, 0xffe3, 0x66]));
+        assert_eq!(cmd("key return\n"), Command::Key(vec![0xff0d]));
+        assert_eq!(cmd("key esc"), Command::Key(vec![0xff1b]));
+        // The rest of the line, spaces and `#` included.
+        assert_eq!(cmd("type a b#é\r\n"), Command::Type(vec![0x61, 0x20, 0x62, 0x23, 0xe9]));
+        assert_eq!(cmd("pointer 1280 720"), Command::Pointer(1280, 720));
+        assert_eq!(cmd("click"), Command::Click(BTN_LEFT));
+        assert_eq!(cmd("click left"), Command::Click(BTN_LEFT));
+        assert_eq!(cmd("click right"), Command::Click(BTN_RIGHT));
+        assert_eq!(cmd("snapshot /tmp/run/1.png"), Command::Snapshot("/tmp/run/1.png".into()));
+        assert_eq!(cmd("snapshot /tmp/a#1.png"), Command::Snapshot("/tmp/a#1.png".into()));
+        assert_eq!(cmd("type #1"), Command::Type(vec![0x23, 0x31]));
+        assert_eq!(cmd("key cmd+plus"), Command::Key(vec![0xffeb, 0x2b]));
+        assert_eq!(cmd("quit"), Command::Quit);
+    }
+
+    #[test]
+    fn places_points_on_stream_pixels() {
+        let retina = DisplaySize { points: (1280, 720), pixels: (2560, 1440) };
+        assert_eq!(to_pixels((0, 0), retina), (0, 0));
+        assert_eq!(to_pixels((640, 360), retina), (1280, 720));
+        // Past the edge stays on the last pixel.
+        assert_eq!(to_pixels((5000, 720), retina), (2559, 1439));
+        let flat = DisplaySize { points: (2560, 1440), pixels: (2560, 1440) };
+        assert_eq!(to_pixels((100, 200), flat), (100, 200));
+    }
+
+    #[test]
+    fn a_click_converts_its_point_with_the_layout_of_the_moment() {
+        let flat = DisplaySize { points: (1280, 720), pixels: (1280, 720) };
+        let retina = DisplaySize { points: (1280, 720), pixels: (2560, 1440) };
+        assert_eq!(pointer_pixels(Some((100, 50)), Some(flat)), Ok((100, 50)));
+        assert_eq!(pointer_pixels(Some((100, 50)), Some(retina)), Ok((200, 100)));
+        assert!(pointer_pixels(None, Some(flat)).is_err());
+        assert!(pointer_pixels(Some((100, 50)), None).is_err());
+    }
+
+    #[test]
+    fn drops_a_line_that_is_too_long_up_to_its_newline() {
+        let mut lines = Lines::default();
+        let long = "x".repeat(MAX_LINE) + "key c";
+        assert_eq!(lines.push(format!("key a\n{long}").as_bytes()), vec![Some("key a".to_string())]);
+        // The tail of the long line arrives later, and still belongs to it.
+        assert_eq!(lines.push(b" more\nkey b\n"), vec![None, Some("key b".to_string())]);
+        let exact = "y".repeat(MAX_LINE);
+        assert_eq!(lines.push(format!("{exact}\n").as_bytes()), vec![Some(exact)]);
+    }
+
+    struct Sink(crossbeam_channel::Sender<Event>);
+
+    impl super::super::EventSink for Sink {
+        fn emit(&self, event: Event) {
+            let _ = self.0.send(event);
+        }
+    }
+
+    /// Runs the FIFO reader with a local TCP pair in place of the Mac, and
+    /// reads what reaches the other end.
+    #[test]
+    fn fifo_sends_input_and_stops_after_quit() {
+        use crate::proto::messages::encrypted_pointer_event;
+        use crate::proto::offers::MediaOffer;
+        use crate::proto::record::{Opened, RecordKeys, RecordOpener, RecordSealer};
+
+        let op = OperatingPoint {
+            render_scale: 1.0,
+            fps: Fps::Sixty,
+            recovery: Recovery::FirPli,
+            hold: HoldMode::Auto,
+            ltr: true,
+            after_loss: AfterLoss::Idr,
+        };
+        let (events_tx, events) = crossbeam_channel::unbounded();
+        let shared = Arc::new(Shared::new(Arc::new(Mutex::new(op)), Arc::new(Sink(events_tx))));
+        *shared.display.lock() = Some(DisplaySize { points: (1280, 720), pixels: (2560, 1440) });
+        let keys = RecordKeys { key: [1; 16], iv: [2; 16] };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut host, _) = listener.accept().unwrap();
+        host.set_read_timeout(Some(std::time::Duration::from_millis(500))).unwrap();
+        let control = Arc::new(Control {
+            writer: Mutex::new((client, RecordSealer::new(&keys))),
+            record_key: keys.key,
+            video_ssrc: 1,
+            offer: Mutex::new(MediaOffer::generate(false, false, op.offer_options())),
+        });
+        let path = std::env::temp_dir().join(format!("pippin-fifo-input-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let fifo = open_fifo(&path).unwrap();
+        let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let (fb, _fb_rx) = crossbeam_channel::unbounded();
+        let reader = {
+            let (shared, control) = (shared.clone(), control.clone());
+            std::thread::spawn(move || control_fifo(shared, control, fifo, fb))
+        };
+        let mut opener = RecordOpener::new(&keys);
+        let mut next = || match opener.read(&mut host) {
+            Ok(Opened::Message(m)) => Some(m),
+            _ => None,
+        };
+
+        let long = "x".repeat(MAX_LINE) + "key c";
+        writer.write_all(format!("pointer 100 50\n{long}\n").as_bytes()).unwrap();
+        assert_eq!(next(), Some(encrypted_pointer_event(&keys.key, 0, 200, 100)));
+        // The backing scale changes before the click: it lands on the same point.
+        *shared.display.lock() = Some(DisplaySize { points: (1280, 720), pixels: (1280, 720) });
+        writer.write_all(b"click\nquit\nkey b\n").unwrap();
+        assert_eq!(next(), Some(encrypted_pointer_event(&keys.key, BTN_LEFT, 100, 50)));
+        assert_eq!(next(), Some(encrypted_pointer_event(&keys.key, 0, 100, 50)));
+        // Neither the tail of the long line nor the key after quit arrives.
+        assert_eq!(next(), None);
+        assert!(matches!(events.recv().unwrap(), Event::Closed(None)));
+        shared.stop.store(true, std::sync::atomic::Ordering::Release);
+        reader.join().unwrap();
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

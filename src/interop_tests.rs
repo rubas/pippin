@@ -64,7 +64,7 @@ fn srtcp_matches_reference() {
     let mut tx = SrtcpSender::new(&key);
     assert_eq!(tx.protect(&hex(KEYFRAME)), hex(KEYFRAME_SRTCP0));
     assert_eq!(tx.protect(&hex(LTR)), hex(LTR_SRTCP1));
-    let rx = SrtcpReceiver::new(&key);
+    let mut rx = SrtcpReceiver::new(&key);
     assert_eq!(rx.unprotect(&hex(LTR_SRTCP1)).unwrap(), hex(LTR));
 }
 

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-use super::auth::{self, AuthError};
+use super::auth;
 use crate::errors::Failure;
 use super::messages::{self, DisplayRequest, ENC_RECORD_KEYS};
 use super::offers::{CanvasInfo, MediaOffer, OfferOptions, parse_answer};
@@ -31,6 +31,8 @@ pub enum SessionMode {
     Alt,
 }
 
+pub type OnOpen = Box<dyn Fn(&TcpStream) + Send + Sync>;
+
 pub struct ConnectParams {
     pub addr: SocketAddrV4,
     pub user: String,
@@ -41,7 +43,7 @@ pub struct ConnectParams {
     pub offer: OfferOptions,
     /// Shown each control connection as soon as it's open, so the caller
     /// can shut it down to abort a handshake stuck waiting on the host.
-    pub on_open: Option<Box<dyn Fn(&TcpStream) + Send + Sync>>,
+    pub on_open: Option<OnOpen>,
     /// Polled before each new connection; true abandons the handshake.
     pub stopped: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 }
@@ -112,23 +114,13 @@ fn open(p: &ConnectParams) -> Result<TcpStream> {
     Ok(s)
 }
 
-/// Opens a connection and authenticates, preferring SRP and falling back to
-/// the RSA1/AES path on a fresh connection when the host lacks SRP.
+/// Opens a connection and logs in with SRP. There is no other login: the
+/// legacy RSA1 path sends the password under an RSA key that nothing
+/// authenticates, so a spoofed host could read it.
 fn authenticate(p: &ConnectParams) -> Result<(TcpStream, [u8; 16])> {
     let mut s = open(p)?;
-    match auth::srp_auth(&mut s, &p.user, &p.password) {
-        Ok(key) => {
-            tracing::info!("authenticated (SRP)");
-            return Ok((s, key));
-        }
-        Err(e) if matches!(e.downcast_ref::<AuthError>(), Some(AuthError::SrpUnavailable(_))) => {
-            tracing::info!("{e}; retrying with legacy auth");
-        }
-        Err(e) => return Err(e.context("SRP authentication failed")),
-    }
-    let mut s = open(p)?;
-    let key = auth::nonsrp_auth(&mut s, &p.user, &p.password).context("legacy authentication failed")?;
-    tracing::info!("authenticated (legacy RSA1)");
+    let key = auth::srp_auth(&mut s, &p.user, &p.password).context("SRP authentication failed")?;
+    tracing::info!("authenticated (SRP)");
     Ok((s, key))
 }
 
@@ -169,7 +161,9 @@ fn session_select_pending(s: &TcpStream) -> Result<bool> {
     result
 }
 
-fn session_select(s: &mut TcpStream, p: &ConnectParams, auth_key: &[u8; 16]) -> Result<()> {
+/// Answers the SessionSelect prompt. Returns the AES blocks that it
+/// encrypted under `auth_key`.
+fn session_select(s: &mut TcpStream, p: &ConnectParams, auth_key: &[u8; 16]) -> Result<Vec<[u8; 16]>> {
     let prompt = read_vec(s, 76)?;
     if prompt[..4] != SESSION_SELECT_MAGIC {
         bail!("malformed SessionSelect prompt");
@@ -181,7 +175,7 @@ fn session_select(s: &mut TcpStream, p: &ConnectParams, auth_key: &[u8; 16]) -> 
         .map(|u| String::from_utf8_lossy(u).into_owned())
         .unwrap_or_default();
 
-    let (cmd, body) = match p.session_mode {
+    let (cmd, body, sealed) = match p.session_mode {
         SessionMode::Share => {
             tracing::info!("{console_user:?} is logged in at the console; asking them to share");
             let mut body = vec![0u8; 72];
@@ -189,16 +183,16 @@ fn session_select(s: &mut TcpStream, p: &ConnectParams, auth_key: &[u8; 16]) -> 
             let u = console_user.as_bytes();
             let n = u.len().min(72 - 9);
             body[8..8 + n].copy_from_slice(&u[..n]);
-            (0u32, body)
+            (0u32, body, Vec::new())
         }
         SessionMode::Alt => {
             tracing::info!("{console_user:?} is logged in at the console; opening a separate session");
             let mut body = vec![0u8; 200];
             body[0..2].copy_from_slice(&2u16.to_be_bytes());
             body[6] = 2;
-            body[0x48..0x88].copy_from_slice(&auth::ecb_field(auth_key, &p.user));
-            body[0x88..0xC8].copy_from_slice(&auth::ecb_field(auth_key, &p.password));
-            (2, body)
+            let fields = [auth::ecb_field(auth_key, &p.user), auth::ecb_field(auth_key, &p.password)].concat();
+            body[0x48..0xC8].copy_from_slice(&fields);
+            (2, body, fields.as_chunks::<16>().0.to_vec())
         }
     };
     if flags >> cmd & 1 == 0 {
@@ -222,12 +216,17 @@ fn session_select(s: &mut TcpStream, p: &ConnectParams, auth_key: &[u8; 16]) -> 
     if n == 0 {
         return Err(Failure::ShareDeclined.into());
     }
-    Ok(())
+    Ok(sealed)
 }
 
 /// Reads plaintext server messages until the FramebufferUpdate carrying the
 /// record-layer keys (encoding 1103). Everything after it is encrypted.
-fn read_record_keys(s: &mut TcpStream, auth_key: &[u8; 16]) -> Result<RecordKeys> {
+///
+/// Nothing authenticates the blob, so an intermediary could copy a block
+/// from `sealed`, such as `E(0)` from the zero padding of the user name, to
+/// set a record key or IV that it knows. A real host never sends one of
+/// those blocks, so the blob is refused.
+fn read_record_keys<S: Read>(s: &mut S, auth_key: &[u8; 16], sealed: &[[u8; 16]]) -> Result<RecordKeys> {
     loop {
         let mut t = [0u8; 1];
         s.read_exact(&mut t)?;
@@ -245,6 +244,9 @@ fn read_record_keys(s: &mut TcpStream, auth_key: &[u8; 16]) -> Result<RecordKeys
                     match enc {
                         ENC_RECORD_KEYS => {
                             let blob = read_vec(s, 36)?;
+                            if blob[4..].as_chunks::<16>().0.iter().any(|b| sealed.contains(b)) {
+                                bail!("the record keys reuse a block that we encrypted; an intermediary may have set them");
+                            }
                             keys = RecordKeys::unwrap(&blob, auth_key);
                         }
                         1010 | 1011 => {
@@ -286,6 +288,7 @@ pub fn connect(p: &ConnectParams) -> Result<Negotiated> {
     let mut server_size = client_init(&mut s)?;
 
     let mut shared_console = false;
+    let mut sealed = Vec::new();
     if session_select_pending(&s)? {
         if p.session_mode == SessionMode::Alt {
             // Screen Sharing.app re-authenticates on a fresh connection
@@ -294,7 +297,7 @@ pub fn connect(p: &ConnectParams) -> Result<Negotiated> {
             (s, auth_key) = authenticate(p)?;
             server_size = client_init(&mut s)?;
         }
-        session_select(&mut s, p, &auth_key)?;
+        sealed = session_select(&mut s, p, &auth_key)?;
         shared_console = p.session_mode == SessionMode::Share;
     }
 
@@ -303,7 +306,7 @@ pub fn connect(p: &ConnectParams) -> Result<Negotiated> {
     s.write_all(&messages::set_display_configuration(&p.display))?;
     s.write_all(&messages::set_encodings())?;
 
-    let keys = read_record_keys(&mut s, &auth_key).map_err(|e| {
+    let keys = read_record_keys(&mut s, &auth_key, &sealed).map_err(|e| {
         // A console user who refuses the share request just drops us.
         let eof = e.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof);
         if shared_console && eof {
@@ -347,13 +350,17 @@ pub fn connect(p: &ConnectParams) -> Result<Negotiated> {
             Opened::Message(m) => m,
             Opened::BadMac => continue,
         };
-        match (msg.first(), parse_answer(&msg)) {
-            (Some(0x00), Some(c)) if !c.is_degenerate() => {
+        let answer = if msg.first() == Some(&0x00) { parse_answer(&msg) } else { None };
+        // The reader still gets the whole message: the update that carries
+        // the answer can carry the display layout and a cursor too.
+        pending.push(msg);
+        match answer {
+            Some(c) if !c.is_degenerate() => {
                 tracing::info!("encoder canvas {}x{} in {} tiles", c.width, c.height, c.tiles);
                 canvas = Some(c);
                 break;
             }
-            (Some(0x00), Some(c)) => {
+            Some(c) => {
                 tracing::debug!("degenerate canvas answer; re-offering");
                 canvas = Some(c);
                 if retries >= DEGENERATE_RETRIES {
@@ -365,7 +372,7 @@ pub fn connect(p: &ConnectParams) -> Result<Negotiated> {
                 s.write_all(&sealer.seal(&offer_msg))?;
                 deadline = Instant::now() + ANSWER_TIMEOUT;
             }
-            _ => pending.push(msg),
+            None => {}
         }
     }
 
@@ -379,4 +386,46 @@ pub fn connect(p: &ConnectParams) -> Result<Negotiated> {
         server_size,
         pending,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AUTH_KEY: [u8; 16] = [3; 16];
+
+    /// A plaintext FramebufferUpdate with one 1103 rect around `key` and
+    /// `iv`, both already wrapped.
+    fn record_keys_update(key: [u8; 16], iv: [u8; 16]) -> Vec<u8> {
+        let rect = [&[0u8; 8][..], &ENC_RECORD_KEYS.to_be_bytes()].concat();
+        [&[0x00, 0x00, 0x00, 0x01][..], &rect, &[0, 0, 0, 1], &key, &iv].concat()
+    }
+
+    fn wrapped(mut block: [u8; 16]) -> [u8; 16] {
+        auth::ecb_block(&AUTH_KEY, &mut block);
+        block
+    }
+
+    #[test]
+    fn record_keys_copied_from_our_alt_credentials_are_refused() {
+        let user = auth::ecb_field(&AUTH_KEY, "alice");
+        let sealed = user.as_chunks::<16>().0.to_vec();
+        // Bytes 16..32 of the field are zero padding, so they hold E(0).
+        let zero = sealed[1];
+        let update = record_keys_update(zero, zero);
+
+        let keys = read_record_keys(&mut &update[..], &AUTH_KEY, &[]).unwrap();
+        assert_eq!((keys.key, keys.iv), ([0; 16], [0; 16]), "the intermediary would know both");
+
+        let e = read_record_keys(&mut &update[..], &AUTH_KEY, &sealed).err().unwrap();
+        assert!(e.to_string().contains("reuse a block that we encrypted"), "{e:#}");
+    }
+
+    #[test]
+    fn fresh_record_keys_pass_after_alt_credentials() {
+        let sealed = auth::ecb_field(&AUTH_KEY, "alice").as_chunks::<16>().0.to_vec();
+        let update = record_keys_update(wrapped([0x11; 16]), wrapped([0x22; 16]));
+        let keys = read_record_keys(&mut &update[..], &AUTH_KEY, &sealed).unwrap();
+        assert_eq!((keys.key, keys.iv), ([0x11; 16], [0x22; 16]));
+    }
 }
