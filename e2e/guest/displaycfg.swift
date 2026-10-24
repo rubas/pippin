@@ -3,20 +3,11 @@
 // other display through the private SkyLight call SLSConfigureDisplayEnabled.
 // WindowServer applies the change about 2 s after the call returns.
 //
-//   displaycfg disable
-//
 // Build: swiftc -O -o displaycfg displaycfg.swift
 import CoreGraphics
 import Foundation
 
 let VDISPLAY_VENDOR: UInt32 = 0x1AB2
-
-func online() -> [CGDirectDisplayID] {
-  var ids = [CGDirectDisplayID](repeating: 0, count: 32)
-  var n: UInt32 = 0
-  CGGetOnlineDisplayList(32, &ids, &n)
-  return Array(ids[0..<Int(n)])
-}
 
 func die(_ message: String) -> Never {
   FileHandle.standardError.write("displaycfg: \(message)\n".data(using: .utf8)!)
@@ -29,12 +20,14 @@ func check(_ what: String, _ err: CGError) {
 
 typealias EnableFn = @convention(c) (CGDisplayConfigRef, CGDirectDisplayID, Bool) -> CGError
 
-guard CommandLine.arguments.dropFirst().first == "disable" else { die("usage: displaycfg disable") }
 let sky = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_NOW)
 guard let p = dlsym(sky, "SLSConfigureDisplayEnabled") else { die("no SLSConfigureDisplayEnabled") }
 let enable = unsafeBitCast(p, to: EnableFn.self)
 
-let ids = online()
+var ids = [CGDirectDisplayID](repeating: 0, count: 32)
+var n: UInt32 = 0
+check("CGGetOnlineDisplayList", CGGetOnlineDisplayList(32, &ids, &n))
+ids = Array(ids[0..<Int(n)])
 guard let vd = ids.first(where: { CGDisplayVendorNumber($0) == VDISPLAY_VENDOR }) else { die("no vdisplay online") }
 
 var cfg: CGDisplayConfigRef?

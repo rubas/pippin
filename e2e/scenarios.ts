@@ -83,7 +83,7 @@ async function startVdisplay(ctx: Context): Promise<void> {
 // main at 0,0, as on the mini.
 async function onlyVdisplay(ctx: Context): Promise<void> {
   await ctx.guest.put("displaycfg", await swiftTool("displaycfg"), "755");
-  await ctx.guest.sh("./displaycfg disable");
+  await ctx.guest.sh("./displaycfg");
   const only = (cg: string[]) => cg.length === 1 && /^cg \S+ \d+x\d+\+0\+0 vendor 0x1ab2 active main$/.test(cg[0]!);
   const cg = async (timeoutMs?: number) =>
     (await ctx.guest.displays(timeoutMs)).split("\n").filter((l) => l.startsWith("cg "));
