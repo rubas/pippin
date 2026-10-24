@@ -91,8 +91,8 @@ pub struct Config {
     pub control_fifo: Option<PathBuf>,
     /// Plays the Mac's sound; `None` asks the host not to send any.
     pub audio: Option<crate::audio::Player>,
-    /// Mirror the local clipboard and the host pasteboard.
-    pub clipboard: bool,
+    /// Which way the local clipboard and the host pasteboard are shared.
+    pub clipboard: crate::clipboard::Mode,
 }
 
 pub type AuthHook = Arc<dyn Fn(bool) + Send + Sync>;
@@ -180,10 +180,18 @@ pub struct Control {
 }
 
 impl Control {
-    pub fn send(&self, msg: &[u8]) {
+    /// Sends one message. Its records go out in one write under the lock, so
+    /// no other message lands between the records of a large one.
+    pub fn try_send(&self, msg: &[u8]) -> std::io::Result<()> {
         let mut w = self.writer.lock();
         let rec = w.1.seal(msg);
-        if let Err(e) = w.0.write_all(&rec) {
+        w.0.write_all(&rec)
+    }
+
+    /// Sends one message. A failure means the connection is gone, which the
+    /// control reader reports.
+    pub fn send(&self, msg: &[u8]) {
+        if let Err(e) = self.try_send(msg) {
             tracing::debug!("control send failed: {e}");
         }
     }
@@ -670,9 +678,12 @@ fn run(cfg: Config, display: Option<DisplayRequest>, shared: Arc<Shared>, thread
         let offer = neg.offer.clone();
         spawn(threads, "feedback", move || media::feedback(shared, sockets, offer, fb_rx, dec_tx));
     }
-    if cfg.clipboard {
+    let clipboard = cfg.clipboard;
+    if clipboard != crate::clipboard::Mode::Off {
         let (s, c) = (shared.clone(), control.clone());
-        spawn(threads, "clipboard", move || crate::clipboard::run(s, c, clip_rx));
+        spawn(threads, "clipboard", move || crate::clipboard::run(s, c, clip_rx, clipboard));
+    }
+    if clipboard.receives() {
         // Subscribe to pasteboard changes and prime with the current contents.
         control.send(&crate::proto::clipboard::enable_auto_pasteboard());
         control.send(&crate::proto::clipboard::request_pasteboard());
