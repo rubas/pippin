@@ -142,20 +142,24 @@ impl App {
         Some((x as u16, y as u16))
     }
 
+    /// The session and the canvas pixel under the cursor.
+    fn at_cursor(&self) -> Option<(&Session, u16, u16)> {
+        let (x, y) = self.canvas_point(self.cursor_pos?)?;
+        Some((self.session.as_ref()?, x, y))
+    }
+
     fn send_pointer(&self, buttons: u8) {
-        if let (Some(s), Some(pos)) = (&self.session, self.cursor_pos)
-            && let Some((x, y)) = self.canvas_point(pos) {
-                s.pointer(buttons, x, y);
-            }
+        if let Some((s, x, y)) = self.at_cursor() {
+            s.pointer(buttons, x, y);
+        }
     }
 
     fn scroll(&mut self, delta: MouseScrollDelta, phase: TouchPhase) {
         let scale = self.window.as_ref().map_or(1.0, |w| w.scale_factor());
         let steps = self.scroll.add(scroll::points(delta, scale), phase);
-        if let (Some(s), Some(pos)) = (&self.session, self.cursor_pos)
-            && let Some((x, y)) = self.canvas_point(pos) {
-                s.scroll(self.buttons, x, y, steps);
-            }
+        if let Some((s, x, y)) = self.at_cursor() {
+            s.scroll(self.buttons, x, y, steps);
+        }
     }
 
     fn key(&mut self, ev: &KeyEvent) {

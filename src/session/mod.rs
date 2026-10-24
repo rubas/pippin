@@ -190,14 +190,13 @@ impl Control {
         stream: TcpStream,
         sealer: RecordSealer,
         record_key: [u8; 16],
-        video_ssrc: u32,
         offer: MediaOffer,
         threads: &Mutex<Vec<JoinHandle<()>>>,
     ) -> std::io::Result<Arc<Self>> {
         let socket = stream.try_clone()?;
         let (tx, rx) = crossbeam_channel::unbounded();
         spawn(threads, "control-tx", move || writer::run(rx, stream, sealer, record_key));
-        Ok(Arc::new(Control { queue: Mutex::new(Some(tx)), socket, video_ssrc, offer: Mutex::new(offer) }))
+        Ok(Arc::new(Control { queue: Mutex::new(Some(tx)), socket, video_ssrc: offer.video_ssrc, offer: Mutex::new(offer) }))
     }
 
     fn queue(&self, item: Outgoing) {
@@ -660,7 +659,7 @@ fn run(cfg: Config, display: Option<DisplayRequest>, shared: Arc<Shared>, thread
     let _ = socket2::SockRef::from(&neg.stream).set_tcp_user_timeout(Some(CONTROL_ACK_TIMEOUT));
     let mut reader = neg.stream.try_clone()?;
     reader.set_read_timeout(None)?;
-    let control = Control::start(neg.stream, neg.sealer, neg.record_key, neg.offer.video_ssrc, neg.offer.clone(), threads)?;
+    let control = Control::start(neg.stream, neg.sealer, neg.record_key, neg.offer.clone(), threads)?;
     let _ = shared.control.set(control.clone());
     // shutdown() may have run between the check above and the set, seen no
     // control connection, and left us to finish on our own.
@@ -804,7 +803,7 @@ pub(super) mod tests {
         let shared = Arc::new(Shared::new(Arc::new(Mutex::new(OP)), Arc::new(Sink(events_tx)), max_backing));
         let (client, host) = host();
         let offer = MediaOffer::generate(false, false, OP.offer_options());
-        let control = Control::start(client, RecordSealer::new(&KEYS), KEYS.key, 1, offer, &Mutex::new(Vec::new())).unwrap();
+        let control = Control::start(client, RecordSealer::new(&KEYS), KEYS.key, offer, &Mutex::new(Vec::new())).unwrap();
         let _ = shared.control.set(control.clone());
         (shared, control, host, events)
     }
