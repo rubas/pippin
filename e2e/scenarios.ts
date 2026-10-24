@@ -4,7 +4,7 @@
 import { differingPixels, litShare, size } from "./frame";
 import type { Guest } from "./guest";
 import type { Login } from "./login";
-import { readFile } from "./mini";
+import { readFile, swiftTool } from "./mini";
 import { decoded, Session, SIZE } from "./pippin";
 import { waitFor } from "./proc";
 
@@ -78,6 +78,31 @@ async function startVdisplay(ctx: Context): Promise<void> {
   ctx.check("vdisplay", true, screens.join("; "));
 }
 
+// vdisplay is the only display of the mini, but the VM keeps its own display
+// next to it. displaycfg switches the VM's display off, and vdisplay becomes
+// main at 0,0, as on the mini.
+async function onlyVdisplay(ctx: Context): Promise<void> {
+  await ctx.guest.put("displaycfg", await swiftTool("displaycfg"), "755");
+  await ctx.guest.sh("./displaycfg disable");
+  const only = (cg: string[]) => cg.length === 1 && /^cg \S+ \d+x\d+\+0\+0 vendor 0x1ab2 active main$/.test(cg[0]!);
+  const cg = async (timeoutMs?: number) =>
+    (await ctx.guest.displays(timeoutMs)).split("\n").filter((l) => l.startsWith("cg "));
+  const lines = await waitFor("vdisplay as the only display", 10_000, async (left) => {
+    const lines = await cg(left);
+    return only(lines) ? lines : undefined;
+  }).catch(() => cg());
+  ctx.check("only vdisplay", only(lines), lines.join("; "));
+}
+
+// While pippin is connected, its display must be the main display, and
+// online. pippin names it in its display request (src/proto/messages.rs).
+function checkMain(ctx: Context, displays: string): void {
+  const main = displays.match(/^main (\S+) (online|offline)$/m);
+  const pippin = displays.match(/^screen (\S+) .* pippin Virtual Display$/m);
+  const pass = main?.[2] === "online" && main[1] === pippin?.[1];
+  ctx.check("main display", pass, `main ${main?.slice(1).join(" ") ?? "none"}, pippin display ${pippin?.[1] ?? "none"}`);
+}
+
 const APP = "TextEdit";
 
 function fullscreen(vdisplay: boolean): Scenario {
@@ -86,10 +111,15 @@ function fullscreen(vdisplay: boolean): Scenario {
     async run(ctx) {
       let window: string | undefined, full: string | undefined;
       let windowAt = 0, fullAt = 0;
-      if (vdisplay) await startVdisplay(ctx);
+      if (vdisplay) {
+        await startVdisplay(ctx);
+        await onlyVdisplay(ctx);
+      }
       await Bun.write(`${ctx.out}/displays-before.txt`, await ctx.guest.displays());
       await connected(ctx, ["WindowServer", "screensharingd", APP], async (session) => {
-        await Bun.write(`${ctx.out}/displays-connected.txt`, await ctx.guest.displays());
+        const displays = await ctx.guest.displays();
+        await Bun.write(`${ctx.out}/displays-connected.txt`, displays);
+        checkMain(ctx, displays);
         await ctx.guest.put("/tmp/pippin-e2e.txt", "pippin e2e: this window goes into fullscreen.\n");
         await ctx.guest.sh(`open -a ${APP} /tmp/pippin-e2e.txt`);
         await Bun.sleep(3000);
@@ -114,12 +144,6 @@ function fullscreen(vdisplay: boolean): Scenario {
         const pictures = await decoded(ctx.out, windowAt, fullAt);
         ctx.check("fullscreen picture is new", pixels > 0 && pictures > 0, `${pixels} pixels differ, ${pictures} pictures decoded`);
       }
-      // WindowServer also logs "Invalid display" for the new display of each
-      // Screen Sharing session, before the display exists. Only the app's
-      // lines show the bug.
-      const log = await Bun.file(`${ctx.out}/vm.log`).text();
-      const invalid = log.match(new RegExp(` ${APP}\\[.*Invalid display`, "g"))?.length ?? 0;
-      ctx.check("app finds its display", invalid === 0, `${invalid} lines of ${APP} with "Invalid display" in vm.log`);
     },
   };
 }

@@ -55,6 +55,32 @@ export function readFile(path: string): Promise<Uint8Array> {
   return captureBytes(["ssh", "-o", "ConnectTimeout=10", "macmini", "cat", path]);
 }
 
+// The guest has no compiler, so the mini builds the Swift tools of e2e/guest/.
+const TOOLS = ".cache/pippin-e2e";
+
+/**
+ * Builds a Swift tool of e2e/guest/ on the mini, once for each version of its
+ * source, and returns the binary.
+ */
+export async function swiftTool(name: string): Promise<Uint8Array> {
+  const source = await Bun.file(`${import.meta.dir}/guest/${name}.swift`).text();
+  const bin = `${TOOLS}/${name}-${new Bun.CryptoHasher("sha256").update(source).digest("hex").slice(0, 16)}`;
+  await mini(`cd ~
+if [ ! -x ${bin} ]; then
+  mkdir -p ${TOOLS}
+  rm -f ${TOOLS}/${name}-*(N)
+  src=$(mktemp -d)
+  cat >$src/${name}.swift <<'SWIFT'
+${source}
+SWIFT
+  swiftc -O -o $src/${name} $src/${name}.swift
+  mv $src/${name} ${bin}
+  rm -r $src
+fi
+`);
+  return readFile(bin);
+}
+
 /** Takes the lock for `owner`. Fails when another session holds it. */
 export async function lock(owner: string): Promise<void> {
   await mini(`mkdir -p ~/.cache
