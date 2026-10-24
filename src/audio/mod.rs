@@ -159,10 +159,16 @@ fn output_thread(inner: std::sync::Weak<Inner>, wake: Receiver<()>) {
     let mut failures = 0;
     while wake.recv().is_ok() {
         let Some(shared) = inner.upgrade() else { return };
+        let opened = Instant::now();
         // `_stream` keeps the device open until `play_until_idle` returns.
         match open_stream(shared.clone()).and_then(|(_stream, errors)| play_until_idle(&shared, &errors)) {
             Ok(()) => failures = 0,
             Err(e) => {
+                // A stream that played longer than the longest wait ends
+                // the run of failures.
+                if opened.elapsed() > RETRY_MAX {
+                    failures = 0;
+                }
                 let delay = retry_delay(failures);
                 if failures == 0 {
                     tracing::warn!("no sound: {e:#}; next try in {delay:?}");
@@ -170,8 +176,9 @@ fn output_thread(inner: std::sync::Weak<Inner>, wake: Receiver<()>) {
                     tracing::debug!("audio output: {e:#}; next try in {delay:?}");
                 }
                 failures += 1;
-                shared.jitter.lock().clear();
                 std::thread::sleep(delay);
+                // Sound that came during the wait is late now.
+                shared.jitter.lock().clear();
             }
         }
         shared.running.store(false, Ordering::Release);
