@@ -212,10 +212,17 @@ const SCROLL_PLIST = `<?xml version="1.0" encoding="UTF-8"?>
 </dict></plist>
 `;
 
-/** The scroll events that reached scrolllog, as [deltaX, deltaY]. */
-async function scrolled(ctx: Context): Promise<number[][]> {
+/** A scroll event that reached scrolllog, with the sign of the device: a positive x is left, a positive y up. */
+type Scrolled = { x: number; y: number };
+
+async function scrolled(ctx: Context): Promise<Scrolled[]> {
   const lines = (await ctx.guest.sh(`cat ${SCROLL_LOG}`)).split("\n");
-  return lines.filter((l) => l.startsWith("scroll ")).map((l) => l.split(" ").slice(1).map(Number));
+  return lines
+    .filter((l) => l.startsWith("scroll "))
+    .map((l) => {
+      const [, x, y] = l.split(" ");
+      return { x: Number(x), y: Number(y) };
+    });
 }
 
 const scroll: Scenario = {
@@ -240,9 +247,11 @@ const scroll: Scenario = {
       await Bun.sleep(2000);
       const horizontal = (await scrolled(ctx)).slice(vertical.length);
       await session.snapshot("1-scrolllog");
-      const show = (events: number[][]) => events.map((e) => e.join(",")).join(" ") || "none";
-      ctx.check("vertical scroll", vertical.some(([x, y]) => x === 0 && y !== 0), `events ${show(vertical)}`);
-      ctx.check("horizontal scroll", horizontal.some(([x, y]) => x !== 0 && y === 0), `events ${show(horizontal)}`);
+      const show = (events: Scrolled[]) => events.map((e) => `${e.x},${e.y}`).join(" ") || "none";
+      // AppKit can merge scroll events, so the count of events is not the count of steps.
+      const all = (events: Scrolled[], ok: (e: Scrolled) => boolean) => events.length > 0 && events.every(ok);
+      ctx.check("scroll down", all(vertical, (e) => e.x === 0 && e.y < 0), `events ${show(vertical)}`);
+      ctx.check("scroll right", all(horizontal, (e) => e.x < 0 && e.y === 0), `events ${show(horizontal)}`);
     });
   },
 };

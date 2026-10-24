@@ -1,7 +1,9 @@
 // scrolllog: covers the main display with one window, and appends a line
 // `scroll <deltaX> <deltaY>` to the file in the first argument for each scroll
-// event that reaches it. It writes `ready` once the window shows. Run it in
-// an app bundle with `open`, so that it gets a window in the login session.
+// event that reaches it. The deltas have the sign of the device, also with
+// natural scrolling on: a positive deltaY scrolls up, a positive deltaX left.
+// It writes `ready` once the window shows. Run it in an app bundle with
+// `open`, so that it gets a window in the login session.
 //
 // Build: swiftc -O -o scrolllog scrolllog.swift
 import AppKit
@@ -15,7 +17,8 @@ func write(_ line: String) {
 
 final class View: NSView {
   override func scrollWheel(with event: NSEvent) {
-    write("scroll \(event.scrollingDeltaX) \(event.scrollingDeltaY)")
+    let sign: CGFloat = event.isDirectionInvertedFromDevice ? -1 : 1
+    write("scroll \(sign * event.scrollingDeltaX) \(sign * event.scrollingDeltaY)")
   }
 }
 
