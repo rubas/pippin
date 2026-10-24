@@ -57,14 +57,14 @@ struct Jitter {
 
 impl Jitter {
     /// Queues one decoded packet. Returns whether it holds sound.
-    fn push(&mut self, pcm: &[i16], now: Instant) -> bool {
+    fn push(&mut self, pcm: &[i16]) -> bool {
         let sound = pcm.iter().any(|&s| s != 0);
         // The host sends digital silence whenever nothing plays; it's
         // indistinguishable from the underrun fill, so skip it. The silence
         // right after a sound shorter than the target tops the queue up to
         // the target, else that sound never starts.
         if sound {
-            self.last_sound = Some(now);
+            self.last_sound = Some(Instant::now());
         } else if self.primed || self.queue.is_empty() || self.queue.len() >= samples(TARGET) {
             return false;
         }
@@ -133,7 +133,7 @@ impl Player {
 
     /// Queues one decoded packet of interleaved stereo.
     pub fn push(&self, pcm: &[i16]) {
-        let sound = self.inner.jitter.lock().push(pcm, Instant::now());
+        let sound = self.inner.jitter.lock().push(pcm);
         if sound && !self.inner.running.swap(true, Ordering::AcqRel) {
             let _ = self.inner.wake.try_send(());
         }
@@ -165,13 +165,12 @@ fn output_thread(inner: std::sync::Weak<Inner>, wake: Receiver<()>) {
             Err(e) => {
                 let delay = retry_delay(failures);
                 if failures == 0 {
-                    tracing::warn!("no sound: {e:#}");
+                    tracing::warn!("no sound: {e:#}; next try in {delay:?}");
                 } else {
-                    tracing::debug!("audio output: {e:#}");
+                    tracing::debug!("audio output: {e:#}; next try in {delay:?}");
                 }
                 failures += 1;
                 shared.jitter.lock().clear();
-                tracing::debug!("audio output: next try in {delay:?}");
                 std::thread::sleep(delay);
             }
         }
@@ -262,11 +261,11 @@ mod tests {
         let mut j = Jitter::default();
         let packet = vec![1000i16; 480 * CHANNELS];
         let mut out = vec![0f32; 240 * CHANNELS];
-        j.push(&packet, Instant::now());
+        j.push(&packet);
         j.pull(&mut out);
         assert!(out.iter().all(|&s| s == 0.0), "plays before the buffer reaches the target");
         for _ in 0..3 {
-            j.push(&packet, Instant::now());
+            j.push(&packet);
         }
         j.pull(&mut out);
         assert!(out.iter().all(|&s| s > 0.0));
@@ -277,14 +276,14 @@ mod tests {
         let mut j = Jitter::default();
         let packet = vec![1000i16; 480 * CHANNELS];
         for _ in 0..4 {
-            j.push(&packet, Instant::now());
+            j.push(&packet);
         }
         let mut out = vec![0f32; 2000 * CHANNELS];
         j.pull(&mut out);
         assert_eq!(j.underruns, 1);
         assert!(out[..1920 * CHANNELS].iter().all(|&s| s > 0.0));
         assert!(out[1920 * CHANNELS..].iter().all(|&s| s == 0.0));
-        j.push(&packet, Instant::now());
+        j.push(&packet);
         j.pull(&mut out[..2]);
         assert_eq!(out[0], 0.0, "resumed with less than the target buffered");
     }
@@ -294,7 +293,7 @@ mod tests {
         let mut j = Jitter::default();
         let packet = vec![1i16; 480 * CHANNELS];
         for _ in 0..11 {
-            j.push(&packet, Instant::now());
+            j.push(&packet);
         }
         assert_eq!(j.queue.len(), samples(TARGET));
     }
@@ -309,7 +308,7 @@ mod tests {
         let mut out = vec![0f32; 480 * CHANNELS];
         let mut played = 0;
         for i in 0..100 {
-            j.push(if i < sound_ms / 10 { &sound } else { &silence }, Instant::now());
+            j.push(if i < sound_ms / 10 { &sound } else { &silence });
             if i >= open_after {
                 j.pull(&mut out);
                 played += out.iter().filter(|&&s| s > 0.0).count();
@@ -336,7 +335,7 @@ mod tests {
     #[test]
     fn host_silence_alone_queues_nothing() {
         let mut j = Jitter::default();
-        assert!(!j.push(&[0i16; 480 * CHANNELS], Instant::now()));
+        assert!(!j.push(&[0i16; 480 * CHANNELS]));
         assert!(j.queue.is_empty());
     }
 
