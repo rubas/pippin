@@ -91,6 +91,15 @@
 //! * `presented_fps`: frames handed to the renderer (a frame is one tile
 //!   picture, or one gathered set with `--sync-tiles`). The display may
 //!   still drop some.
+//! * Latency of each tile picture, from the arrival of the first packet of
+//!   its access unit: `latency_decode_p50_ms` and `latency_decode_max_ms`
+//!   until the decoder gave out the picture, `latency_present_p50_ms` and
+//!   `latency_present_max_ms` until it was on screen. The viewer counts a
+//!   picture on screen when its `present` returned (the compositor shows
+//!   it at its next refresh), `--headless` when it took the picture. A
+//!   picture that a newer one of its tile replaced before the renderer took
+//!   it is never on screen and has no present sample. Null when no picture
+//!   came out in the interval.
 //! * `rtt_ms`: smoothed round trip from host reports echoing our SRs; null
 //!   while unknown (the host may never echo them).
 
@@ -118,7 +127,7 @@ const FROZEN_AFTER_MS: u64 = 100;
 /// Waiting for a keyframe counts as frozen only while video flows.
 const FLOWING_MS: u64 = 1500;
 /// Latency samples kept between lines at most.
-const MAX_SAMPLES: usize = 4096;
+pub(super) const MAX_SAMPLES: usize = 4096;
 
 /// Shared counters. Monotonic ones are swapped to zero by the stats writer,
 /// its only reader.
@@ -145,6 +154,10 @@ pub(super) struct Metrics {
     pub decode_ns: AtomicU64,
     pub decode_worst_ns: AtomicU64,
     pub presented: AtomicU64,
+    /// From the first packet of a picture to the decoder output, and to the
+    /// present.
+    decode_latency: Mutex<Vec<Duration>>,
+    present_latency: Mutex<Vec<Duration>>,
     pub awaiting_idr: AtomicBool,
     concealed_pictures: AtomicU64,
     recovery_dropped: AtomicU64,
@@ -205,10 +218,7 @@ impl Metrics {
     /// A NACKed packet arrived, `after` its first NACK.
     pub fn nack_arrived(&self, after: Duration) {
         self.nacked_arrived.fetch_add(1, Ordering::Relaxed);
-        let mut l = self.nack_latency.lock();
-        if l.len() < MAX_SAMPLES {
-            l.push(after);
-        }
+        push_sample(&self.nack_latency, after);
     }
 
     pub fn set_answer_ltrp(&self, ltrp: Option<bool>) {
@@ -233,6 +243,16 @@ impl Metrics {
         self.decoded_aus.fetch_add(1, Ordering::Relaxed);
         self.decode_ns.fetch_add(ns, Ordering::Relaxed);
         self.decode_worst_ns.fetch_max(ns, Ordering::Relaxed);
+    }
+
+    /// A picture came out of the decoder `after` its first packet arrived.
+    pub fn decoded_after(&self, after: Duration) {
+        push_sample(&self.decode_latency, after);
+    }
+
+    /// A picture was on screen `after` its first packet arrived.
+    pub fn presented_after(&self, after: Duration) {
+        push_sample(&self.present_latency, after);
     }
 
     pub fn tile_packet(&self, tile: usize, now_ms: u64) {
@@ -327,11 +347,29 @@ impl Outages {
     }
 }
 
+fn push_sample(samples: &Mutex<Vec<Duration>>, d: Duration) {
+    let mut s = samples.lock();
+    if s.len() < MAX_SAMPLES {
+        s.push(d);
+    }
+}
+
 /// Count, median and max of `samples`, emptying it.
 fn summary(samples: &mut Vec<Duration>) -> (usize, Option<(Duration, Duration)>) {
     let mut s = std::mem::take(samples);
     s.sort_unstable();
     (s.len(), s.last().map(|&max| (s[s.len() / 2], max)))
+}
+
+/// Writes `"<name>_p50_ms"` and `"<name>_max_ms"` of `samples`, emptying
+/// it; both are null without samples.
+fn p50_max(s: &mut String, name: &str, samples: &Mutex<Vec<Duration>>) {
+    let ms = |d: Duration| num(d.as_secs_f64() * 1000.0, 1);
+    let (p50, max) = match summary(&mut samples.lock()) {
+        (_, Some((p50, max))) => (ms(p50), ms(max)),
+        (_, None) => ("null".into(), "null".into()),
+    };
+    let _ = write!(s, ",\"{name}_p50_ms\":{p50},\"{name}_max_ms\":{max}");
 }
 
 /// Formats a float for JSON: finite, at most `digits` decimals.
@@ -438,12 +476,7 @@ fn line(m: &Metrics, cx: &LineContext) -> String {
     }
     s.push(']');
     let _ = write!(s, ",\"nacks\":{},\"nack_retries\":{},\"nacked_arrived\":{}", take(&m.nacked), take(&m.nack_retries), take(&m.nacked_arrived));
-    match summary(&mut m.nack_latency.lock()) {
-        (_, Some((p50, max))) => {
-            let _ = write!(s, ",\"nack_arrival_p50_ms\":{},\"nack_arrival_max_ms\":{}", ms(p50), ms(max));
-        }
-        (_, None) => s.push_str(",\"nack_arrival_p50_ms\":null,\"nack_arrival_max_ms\":null"),
-    }
+    p50_max(&mut s, "nack_arrival", &m.nack_latency);
     let _ = write!(
         s,
         ",\"holds_started\":{},\"holds_filled\":{},\"holds_given_up\":{}",
@@ -484,6 +517,8 @@ fn line(m: &Metrics, cx: &LineContext) -> String {
         if aus == 0 { "null".into() } else { ms(worst) },
         rate(take(&m.presented)),
     );
+    p50_max(&mut s, "latency_decode", &m.decode_latency);
+    p50_max(&mut s, "latency_present", &m.present_latency);
     match cx.rtt {
         Some(r) => {
             let _ = write!(s, ",\"rtt_ms\":{}}}", ms(r));
@@ -710,6 +745,10 @@ mod tests {
         m.nack_arrived(Duration::from_millis(30));
         m.set_answer_ltrp(Some(false));
         m.decoded(Duration::from_millis(3));
+        m.decoded_after(Duration::from_millis(4));
+        m.presented_after(Duration::from_millis(6));
+        m.presented_after(Duration::from_millis(9));
+        m.presented_after(Duration::from_millis(31));
         m.shown(true);
         m.shown(false);
         m.set_decoder("vaapi");
@@ -745,13 +784,15 @@ mod tests {
              \"kf_reoffer\":0,\"kf_stall\":0,\"kf_hw_fallback\":0,\"kf_other\":0,\"kf_suppressed\":0,\
              \"irap_aus\":0,\"irap_bytes\":0,\"irap_follow_bytes\":0,\"recovery_n\":0,\
              \"recovery_p50_ms\":null,\"recovery_max_ms\":null,\"recovery_dropped\":0,\"frozen_ms\":30,\"concealed_ms\":40,\"concealed_pictures\":1,\"decode_aus\":1,\
-             \"decode_avg_ms\":3.0,\"decode_worst_ms\":3.0,\"presented_fps\":0.0,\"rtt_ms\":null}"
+             \"decode_avg_ms\":3.0,\"decode_worst_ms\":3.0,\"presented_fps\":0.0,\"latency_decode_p50_ms\":4.0,\
+             \"latency_decode_max_ms\":4.0,\"latency_present_p50_ms\":9.0,\"latency_present_max_ms\":31.0,\"rtt_ms\":null}"
         );
         // Counters were consumed.
         let again = line(&m, &context(&op, &[]));
         assert!(again.contains("\"video_pps\":0.0"));
         assert!(again.contains("\"canvas\":null,\"answer_ltrp\":false,\"max_tile_fps\":null"));
         assert!(again.contains("\"nack_arrival_p50_ms\":null"));
+        assert!(again.contains("\"latency_decode_p50_ms\":null,\"latency_decode_max_ms\":null,\"latency_present_p50_ms\":null"));
     }
 
     #[test]

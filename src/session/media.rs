@@ -645,9 +645,8 @@ struct DecodeLoop {
     /// tiles would never clear.
     awaiting_idr: bool,
     pts: i64,
-    /// Tile, DONL, whether a hold recovered it, the IRAP epoch and whether
-    /// it was fed after a loss (concealed), per decoder input.
-    origin: HashMap<i64, (usize, Option<u16>, bool, u64, bool)>,
+    /// Where each decoder input came from, by its PTS.
+    origin: HashMap<i64, Origin>,
     /// `--after-loss conceal` only: a loss since the last IRAP, so what is
     /// decoded now is concealed. Never set with `idr`, which gates instead.
     lossy: bool,
@@ -660,8 +659,9 @@ struct DecodeLoop {
     fed_without_output: Option<u32>,
     /// No backend could be reopened; the session has been closed.
     dead: bool,
-    /// Decoded pictures of the frame being gathered, and when it started.
-    batch: Vec<(usize, Picture)>,
+    /// Decoded pictures of the frame being gathered, each with the arrival
+    /// of its first packet, and when the frame started.
+    batch: Vec<(usize, Picture, Instant)>,
     /// Gather tiles into frames; otherwise each picture is shown at once.
     sync_tiles: bool,
     batch_started: Option<Instant>,
@@ -671,6 +671,20 @@ struct DecodeLoop {
     /// PIPPIN_DUMP_HEVC: every access unit fed to the decoder, as Annex B,
     /// for offline analysis (ffmpeg -bsf:v trace_headers) and benchmarks.
     dump: Option<std::io::BufWriter<std::fs::File>>,
+}
+
+/// One access unit fed to the decoder, kept until its picture comes out.
+struct Origin {
+    tile: usize,
+    donl: Option<u16>,
+    /// A hold recovered it.
+    recovered: bool,
+    /// The IRAP epoch it was fed in.
+    epoch: u64,
+    /// Fed after a loss and before the next IRAP.
+    concealed: bool,
+    /// When its first packet arrived.
+    received: Instant,
 }
 
 fn open_dump() -> Option<std::io::BufWriter<std::fs::File>> {
@@ -863,7 +877,15 @@ impl DecodeLoop {
         }
 
         self.pts += 1;
-        self.origin.insert(self.pts, (tile, au.donl, au.recovered, self.epoch, self.lossy));
+        let origin = Origin {
+            tile,
+            donl: au.donl,
+            recovered: au.recovered,
+            epoch: self.epoch,
+            concealed: self.lossy,
+            received: au.received,
+        };
+        self.origin.insert(self.pts, origin);
         let mut pictures = Vec::new();
         if let Some(d) = self.dump.as_mut() {
             let _ = std::io::Write::write_all(d, &annexb);
@@ -871,7 +893,7 @@ impl DecodeLoop {
         let started = Instant::now();
         // Concealed pictures may still be in the decoder after the
         // keyframe that ended the loss was fed.
-        let concealed_in_flight = self.origin.values().any(|o| o.4);
+        let concealed_in_flight = self.origin.values().any(|o| o.concealed);
         self.decoder.set_lenient(self.lossy || concealed_in_flight);
         let ok = self.decoder.decode(&annexb, self.pts, &mut |p| pictures.push(p));
         let slices = au.nalus.iter().filter(|n| hevc::is_slice(n)).count();
@@ -920,10 +942,12 @@ impl DecodeLoop {
     }
 
     fn publish(&mut self, pic: Picture) {
-        let Some((tile, donl, recovered, epoch, concealed)) = self.origin.remove(&pic.pts) else {
+        let Some(Origin { tile, donl, recovered, epoch, concealed, received }) = self.origin.remove(&pic.pts) else {
             return;
         };
-        self.shared.metrics.picture(tile, epoch, self.shared.clock.now_ms(), Instant::now());
+        let now = Instant::now();
+        self.shared.metrics.picture(tile, epoch, self.shared.clock.now_ms(), now);
+        self.shared.metrics.decoded_after(now.saturating_duration_since(received));
         self.shared.metrics.shown(concealed);
         if pic.damaged {
             if recovered {
@@ -942,11 +966,11 @@ impl DecodeLoop {
         }
         self.shared.touch(&self.shared.last_frame);
         // A second picture for the same tile means a new frame has begun.
-        if self.batch.iter().any(|(t, _)| *t == tile) {
+        if self.batch.iter().any(|(t, ..)| *t == tile) {
             self.flush(Flush::Repeat);
         }
         self.batch_started.get_or_insert_with(Instant::now);
-        self.batch.push((tile, pic));
+        self.batch.push((tile, pic, received));
         if !self.sync_tiles || self.batch.len() >= self.shared.tiles.load(Ordering::Relaxed) as usize {
             self.flush(Flush::Complete);
         }
@@ -969,7 +993,7 @@ impl DecodeLoop {
             return;
         }
         let held = started.elapsed();
-        let tiles: Vec<usize> = self.batch.iter().map(|(t, _)| *t).collect();
+        let tiles: Vec<usize> = self.batch.iter().map(|(t, ..)| *t).collect();
         tracing::trace!("present tiles {tiles:?} ({why:?}, held {:.1} ms)", held.as_secs_f64() * 1000.0);
         self.gather.record(why, tiles.len(), held);
         self.shared.metrics.presented.fetch_add(1, Ordering::Relaxed);
