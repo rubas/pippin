@@ -241,6 +241,13 @@ impl Metrics {
         }
     }
 
+    /// Session clock (ms) of the latest packet and the latest picture of
+    /// `tile`, 0 for none yet.
+    pub fn tile_progress(&self, tile: usize) -> (u64, u64) {
+        let ms = |t: Option<&AtomicU64>| t.map_or(0, |t| t.load(Ordering::Relaxed));
+        (ms(self.tile_packet_ms.get(tile)), ms(self.tile_picture_ms.get(tile)))
+    }
+
     /// A packet with a newer RTP timestamp arrived for `tile`.
     pub fn tile_frame(&self, tile: usize) {
         if let Some(t) = self.tile_frames.get(tile) {
