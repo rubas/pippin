@@ -4,6 +4,8 @@
 //! Threads:
 //! * `control` connects, then reads the encrypted TCP control channel
 //!   (cursor shapes, display layout, clipboard, media answers).
+//! * `control-tx` writes every message to the control channel, in order;
+//!   see [`writer`].
 //! * `video-rx` receives SRTP video, assembles access units, maps SSRCs to
 //!   tiles and hands work to `decoder`.
 //! * `decoder` runs libavcodec and publishes pictures to the [`FrameStore`].
@@ -20,9 +22,9 @@ mod control;
 mod media;
 mod metrics;
 mod operating;
+mod writer;
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -44,6 +46,7 @@ use crate::rtp::stats::ReceiverStats;
 use crate::video::decoder::{DecoderKind, Picture};
 
 pub use media::{Feedback, KeyframeCause};
+use writer::{Outgoing, Pointer};
 pub use operating::{AfterLoss, Fps, OperatingPoint, SharedOp};
 
 use crate::errors::Failure;
@@ -167,11 +170,13 @@ impl FrameStore {
     }
 }
 
-/// The encrypted control-channel writer. The lock keeps record sequence
-/// numbers in wire order across threads.
+/// The control channel for sending: every message goes into the queue of
+/// the writer thread, which owns the socket (see [`writer`]).
 pub struct Control {
-    writer: Mutex<(TcpStream, RecordSealer)>,
-    record_key: [u8; 16],
+    /// `None` once the session closed it.
+    queue: Mutex<Option<Sender<Outgoing>>>,
+    /// The socket of the writer, to reset at shutdown.
+    socket: TcpStream,
     /// Our video SSRC, the one our SRs are sent as.
     video_ssrc: u32,
     /// The media offer, re-sent after a resize and changed by the
@@ -180,12 +185,29 @@ pub struct Control {
 }
 
 impl Control {
-    pub fn send(&self, msg: &[u8]) {
-        let mut w = self.writer.lock();
-        let rec = w.1.seal(msg);
-        if let Err(e) = w.0.write_all(&rec) {
-            tracing::debug!("control send failed: {e}");
+    /// Starts the writer thread for `stream`.
+    fn start(
+        stream: TcpStream,
+        sealer: RecordSealer,
+        record_key: [u8; 16],
+        video_ssrc: u32,
+        offer: MediaOffer,
+        threads: &Mutex<Vec<JoinHandle<()>>>,
+    ) -> std::io::Result<Arc<Self>> {
+        let socket = stream.try_clone()?;
+        let (tx, rx) = crossbeam_channel::unbounded();
+        spawn(threads, "control-tx", move || writer::run(rx, stream, sealer, record_key));
+        Ok(Arc::new(Control { queue: Mutex::new(Some(tx)), socket, video_ssrc, offer: Mutex::new(offer) }))
+    }
+
+    fn queue(&self, item: Outgoing) {
+        if let Some(q) = &*self.queue.lock() {
+            let _ = q.send(item);
         }
+    }
+
+    pub fn send(&self, msg: &[u8]) {
+        self.queue(Outgoing::Message(msg.to_vec()));
     }
 
     pub fn key(&self, down: bool, keysym: u32) {
@@ -194,7 +216,24 @@ impl Control {
 
     /// Pointer position in canvas pixels plus the RFB button mask.
     pub fn pointer(&self, buttons: u8, x: u16, y: u16) {
-        self.send(&messages::encrypted_pointer_event(&self.record_key, buttons, x, y));
+        self.queue(Outgoing::Pointer(Pointer { buttons, x, y }));
+    }
+
+    /// Scrolls whole wheel steps at a pointer position in canvas pixels:
+    /// `steps.0` positive scrolls right, `steps.1` positive scrolls down.
+    pub fn scroll(&self, buttons: u8, x: u16, y: u16, steps: (i32, i32)) {
+        for p in writer::scroll(Pointer { buttons, x, y }, steps) {
+            self.queue(Outgoing::Pointer(p));
+        }
+    }
+
+    /// Ends the writer and resets the connection, so the host tears the
+    /// session down at once instead of waiting out its own timeouts.
+    fn close(&self) {
+        if self.queue.lock().take().is_some() {
+            let _ = socket2::SockRef::from(&self.socket).set_linger(Some(Duration::ZERO));
+            let _ = self.socket.shutdown(std::net::Shutdown::Both);
+        }
     }
 
     pub fn reoffer(&self) {
@@ -381,6 +420,14 @@ impl Session {
         }
     }
 
+    /// Scrolls whole wheel steps at a pointer position in canvas pixels:
+    /// `steps.0` positive scrolls right, `steps.1` positive scrolls down.
+    pub fn scroll(&self, buttons: u8, x: u16, y: u16, steps: (i32, i32)) {
+        if let Some(c) = self.control() {
+            c.scroll(buttons, x, y, steps);
+        }
+    }
+
     /// The maximum that each display request of this session must carry,
     /// `None` when the session streams the Mac's own display.
     pub fn max_backing(&self) -> Option<(u32, u32)> {
@@ -412,13 +459,10 @@ impl Session {
     /// can, shutdown gives it a moment and then leaves it to exit on its own
     /// via the stop flag rather than freezing the window.
     pub fn shutdown(&self) {
-        let first = !self.shared.stop.swap(true, Ordering::AcqRel);
-        if first && let Some(c) = self.control() {
-            // Reset rather than close so the host tears the session down
-            // immediately instead of waiting out its own timeouts.
-            let w = c.writer.lock();
-            let _ = socket2::SockRef::from(&w.0).set_linger(Some(Duration::ZERO));
-            let _ = w.0.shutdown(std::net::Shutdown::Both);
+        self.shared.stop.store(true, Ordering::Release);
+        // Also when the session stopped itself: its writer runs until then.
+        if let Some(c) = self.control() {
+            c.close();
         }
         if self.control().is_none() {
             if let Some(s) = self.shared.connecting.lock().take() {
@@ -616,17 +660,12 @@ fn run(cfg: Config, display: Option<DisplayRequest>, shared: Arc<Shared>, thread
     let _ = socket2::SockRef::from(&neg.stream).set_tcp_user_timeout(Some(CONTROL_ACK_TIMEOUT));
     let mut reader = neg.stream.try_clone()?;
     reader.set_read_timeout(None)?;
-    let control = Arc::new(Control {
-        writer: Mutex::new((neg.stream, neg.sealer)),
-        record_key: neg.record_key,
-        video_ssrc: neg.offer.video_ssrc,
-        offer: Mutex::new(neg.offer.clone()),
-    });
+    let control = Control::start(neg.stream, neg.sealer, neg.record_key, neg.offer.video_ssrc, neg.offer.clone(), threads)?;
     let _ = shared.control.set(control.clone());
     // shutdown() may have run between the check above and the set, seen no
     // control connection, and left us to finish on our own.
     if shared.stopped() {
-        let _ = control.writer.lock().0.shutdown(std::net::Shutdown::Both);
+        control.close();
         return Ok(());
     }
 
@@ -763,17 +802,19 @@ pub(super) mod tests {
     pub fn connected(max_backing: Option<(u32, u32)>) -> (Arc<Shared>, Arc<Control>, Host, Receiver<Event>) {
         let (events_tx, events) = crossbeam_channel::unbounded();
         let shared = Arc::new(Shared::new(Arc::new(Mutex::new(OP)), Arc::new(Sink(events_tx)), max_backing));
+        let (client, host) = host();
+        let offer = MediaOffer::generate(false, false, OP.offer_options());
+        let control = Control::start(client, RecordSealer::new(&KEYS), KEYS.key, 1, offer, &Mutex::new(Vec::new())).unwrap();
+        let _ = shared.control.set(control.clone());
+        (shared, control, host, events)
+    }
+
+    /// A local TCP connection: pippin's end, and the Mac's end that reads it.
+    pub fn host() -> (TcpStream, Host) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (stream, _) = listener.accept().unwrap();
         stream.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
-        let control = Arc::new(Control {
-            writer: Mutex::new((client, RecordSealer::new(&KEYS))),
-            record_key: KEYS.key,
-            video_ssrc: 1,
-            offer: Mutex::new(MediaOffer::generate(false, false, OP.offer_options())),
-        });
-        let _ = shared.control.set(control.clone());
-        (shared, control, Host { stream, opener: RecordOpener::new(&KEYS) }, events)
+        (client, Host { stream, opener: RecordOpener::new(&KEYS) })
     }
 }
