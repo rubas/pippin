@@ -4,7 +4,8 @@
 //! into a [`Player`], which plays it on the default output device through
 //! a small jitter buffer. The device is opened when sound starts and closed
 //! after a few seconds of silence, since the host keeps sending silent
-//! packets whenever nothing is playing.
+//! packets whenever nothing is playing. When the device fails, the next
+//! try waits longer each time, up to a few seconds.
 
 pub mod aac;
 
@@ -32,6 +33,12 @@ const MAX_BUFFERED: Duration = Duration::from_millis(100);
 const IDLE_CLOSE: Duration = Duration::from_secs(5);
 /// Device period we ask for: 10 ms.
 const PERIOD_FRAMES: u32 = 480;
+/// After the output device fails, wait this long before it is opened again,
+/// and double the wait on each failure in a row, up to [`RETRY_MAX`].
+const RETRY_FIRST: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(8);
+/// How often the open device is checked for idle time and errors.
+const CHECK_EVERY: Duration = Duration::from_millis(250);
 
 fn samples(d: Duration) -> usize {
     (d.as_micros() as usize * SAMPLE_RATE as usize / 1_000_000) * CHANNELS
@@ -49,13 +56,30 @@ struct Jitter {
 }
 
 impl Jitter {
-    fn push(&mut self, pcm: &[i16]) {
+    /// Queues one decoded packet. Returns whether it holds sound.
+    fn push(&mut self, pcm: &[i16], now: Instant) -> bool {
+        let sound = pcm.iter().any(|&s| s != 0);
+        // The host sends digital silence whenever nothing plays; it's
+        // indistinguishable from the underrun fill, so skip it. The silence
+        // right after a sound shorter than the target tops the queue up to
+        // the target, else that sound never starts.
+        if sound {
+            self.last_sound = Some(now);
+        } else if self.primed || self.queue.is_empty() || self.queue.len() >= samples(TARGET) {
+            return false;
+        }
         self.queue.extend(pcm);
         if self.queue.len() > samples(MAX_BUFFERED) {
             let excess = self.queue.len() - samples(TARGET);
             self.queue.drain(..excess);
             self.dropped += excess as u64;
         }
+        sound
+    }
+
+    fn clear(&mut self) {
+        self.queue.clear();
+        self.primed = false;
     }
 
     fn pull<T: SizedSample + FromSample<i16>>(&mut self, out: &mut [T]) {
@@ -109,59 +133,47 @@ impl Player {
 
     /// Queues one decoded packet of interleaved stereo.
     pub fn push(&self, pcm: &[i16]) {
-        // The host sends digital silence whenever nothing plays; it's
-        // indistinguishable from the underrun fill, so skip it.
-        if pcm.iter().all(|&s| s == 0) {
-            return;
-        }
-        {
-            let mut j = self.inner.jitter.lock();
-            j.push(pcm);
-            j.last_sound = Some(Instant::now());
-        }
-        if !self.inner.running.swap(true, Ordering::AcqRel) {
+        let sound = self.inner.jitter.lock().push(pcm, Instant::now());
+        if sound && !self.inner.running.swap(true, Ordering::AcqRel) {
             let _ = self.inner.wake.try_send(());
         }
     }
 
     /// Drops anything buffered, e.g. when the session it came from ends.
     pub fn flush(&self) {
-        let mut j = self.inner.jitter.lock();
-        j.queue.clear();
-        j.primed = false;
+        self.inner.jitter.lock().clear();
     }
 }
 
-/// Opens the device when sound starts and closes it once it stops. Owns
-/// the stream because cpal streams can't move between threads. Exits when
-/// the last [`Player`] is dropped.
+/// How long to wait before the output device is opened again, after it
+/// failed `failures` times in a row: 1 s, 2 s, 4 s, then 8 s.
+fn retry_delay(failures: u32) -> Duration {
+    RETRY_FIRST.saturating_mul(2u32.saturating_pow(failures)).min(RETRY_MAX)
+}
+
+/// Opens the device when sound starts and closes it once it stops. When
+/// the device fails to open or fails while it plays, waits [`retry_delay`]
+/// before the next try. Owns the stream because cpal streams can't move
+/// between threads. Exits when the last [`Player`] is dropped.
 fn output_thread(inner: std::sync::Weak<Inner>, wake: Receiver<()>) {
-    let mut warned = false;
+    let mut failures = 0;
     while wake.recv().is_ok() {
         let Some(shared) = inner.upgrade() else { return };
-        match open_stream(shared.clone()) {
-            Ok(stream) => {
-                tracing::debug!("audio output opened");
-                loop {
-                    std::thread::sleep(Duration::from_millis(250));
-                    let j = shared.jitter.lock();
-                    if j.last_sound.is_none_or(|t| t.elapsed() > IDLE_CLOSE) {
-                        tracing::debug!("audio output closed ({} underruns, {} samples dropped)", j.underruns, j.dropped);
-                        break;
-                    }
+        // `_stream` keeps the device open until `play_until_idle` returns.
+        match open_stream(shared.clone()).and_then(|(_stream, errors)| play_until_idle(&shared, &errors)) {
+            Ok(()) => failures = 0,
+            Err(e) => {
+                let delay = retry_delay(failures);
+                if failures == 0 {
+                    tracing::warn!("no sound: {e:#}");
+                } else {
+                    tracing::debug!("audio output: {e:#}");
                 }
-                drop(stream);
+                failures += 1;
+                shared.jitter.lock().clear();
+                tracing::debug!("audio output: next try in {delay:?}");
+                std::thread::sleep(delay);
             }
-            Err(e) if !warned => {
-                tracing::warn!("no sound: {e:#}");
-                warned = true;
-            }
-            Err(e) => tracing::debug!("audio output: {e:#}"),
-        }
-        {
-            let mut j = shared.jitter.lock();
-            j.queue.clear();
-            j.primed = false;
         }
         shared.running.store(false, Ordering::Release);
         // Pushes that saw `running` still set while we were closing didn't
@@ -174,7 +186,29 @@ fn output_thread(inner: std::sync::Weak<Inner>, wake: Receiver<()>) {
     }
 }
 
-fn open_stream(inner: Arc<Inner>) -> Result<cpal::Stream> {
+/// Keeps the stream open until no sound came for [`IDLE_CLOSE`], or until
+/// the stream reports an error.
+fn play_until_idle(shared: &Inner, errors: &Receiver<cpal::StreamError>) -> Result<()> {
+    tracing::debug!("audio output opened");
+    loop {
+        // The stream holds the sender, so the channel can't disconnect.
+        if let Ok(e) = errors.recv_timeout(CHECK_EVERY) {
+            return Err(e).context("audio output failed");
+        }
+        let mut j = shared.jitter.lock();
+        if j.last_sound.is_none_or(|t| t.elapsed() > IDLE_CLOSE) {
+            tracing::debug!("audio output closed ({} underruns, {} samples dropped)", j.underruns, j.dropped);
+            // Under the same lock as the check: a sound pushed after it
+            // stays queued for the next stream.
+            j.clear();
+            return Ok(());
+        }
+    }
+}
+
+/// Opens and starts the output stream. The receiver gets the stream's
+/// errors; after one, the stream is dead.
+fn open_stream(inner: Arc<Inner>) -> Result<(cpal::Stream, Receiver<cpal::StreamError>)> {
     let device = cpal::default_host().default_output_device().context("no audio output device")?;
     let rate = cpal::SampleRate(SAMPLE_RATE);
     let supported = device
@@ -191,24 +225,30 @@ fn open_stream(inner: Arc<Inner>) -> Result<cpal::Stream> {
     if let cpal::SupportedBufferSize::Range { min, max } = supported.buffer_size() {
         config.buffer_size = cpal::BufferSize::Fixed(PERIOD_FRAMES.clamp(*min, *max));
     }
+    let (tx, errors) = crossbeam_channel::bounded(1);
     let stream = match supported.sample_format() {
-        SampleFormat::F32 => build::<f32>(&device, &config, inner)?,
-        SampleFormat::I16 => build::<i16>(&device, &config, inner)?,
+        SampleFormat::F32 => build::<f32>(&device, &config, inner, tx)?,
+        SampleFormat::I16 => build::<i16>(&device, &config, inner, tx)?,
         f => return Err(anyhow!("unsupported sample format {f}")),
     };
     stream.play()?;
-    Ok(stream)
+    Ok((stream, errors))
 }
 
 fn build<T: SizedSample + FromSample<i16>>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     inner: Arc<Inner>,
+    errors: Sender<cpal::StreamError>,
 ) -> Result<cpal::Stream> {
     Ok(device.build_output_stream(
         config,
         move |out: &mut [T], _| inner.jitter.lock().pull(out),
-        |e| tracing::debug!("audio stream: {e}"),
+        // A dead device reports the same error over and over; the first
+        // one closes the stream.
+        move |e| {
+            let _ = errors.try_send(e);
+        },
         None,
     )?)
 }
@@ -222,11 +262,11 @@ mod tests {
         let mut j = Jitter::default();
         let packet = vec![1000i16; 480 * CHANNELS];
         let mut out = vec![0f32; 240 * CHANNELS];
-        j.push(&packet);
+        j.push(&packet, Instant::now());
         j.pull(&mut out);
         assert!(out.iter().all(|&s| s == 0.0), "plays before the buffer reaches the target");
         for _ in 0..3 {
-            j.push(&packet);
+            j.push(&packet, Instant::now());
         }
         j.pull(&mut out);
         assert!(out.iter().all(|&s| s > 0.0));
@@ -237,14 +277,14 @@ mod tests {
         let mut j = Jitter::default();
         let packet = vec![1000i16; 480 * CHANNELS];
         for _ in 0..4 {
-            j.push(&packet);
+            j.push(&packet, Instant::now());
         }
         let mut out = vec![0f32; 2000 * CHANNELS];
         j.pull(&mut out);
         assert_eq!(j.underruns, 1);
         assert!(out[..1920 * CHANNELS].iter().all(|&s| s > 0.0));
         assert!(out[1920 * CHANNELS..].iter().all(|&s| s == 0.0));
-        j.push(&packet);
+        j.push(&packet, Instant::now());
         j.pull(&mut out[..2]);
         assert_eq!(out[0], 0.0, "resumed with less than the target buffered");
     }
@@ -254,9 +294,57 @@ mod tests {
         let mut j = Jitter::default();
         let packet = vec![1i16; 480 * CHANNELS];
         for _ in 0..11 {
-            j.push(&packet);
+            j.push(&packet, Instant::now());
         }
         assert_eq!(j.queue.len(), samples(TARGET));
+    }
+
+    /// Feeds `sound_ms` of sound and then host silence, in 10 ms packets.
+    /// The device opens after `open_after` packets and then pulls one 10 ms
+    /// period after each packet. Returns the milliseconds of sound played.
+    fn sound_played_ms(sound_ms: usize, open_after: usize) -> usize {
+        let mut j = Jitter::default();
+        let sound = vec![1000i16; 480 * CHANNELS];
+        let silence = vec![0i16; 480 * CHANNELS];
+        let mut out = vec![0f32; 480 * CHANNELS];
+        let mut played = 0;
+        for i in 0..100 {
+            j.push(if i < sound_ms / 10 { &sound } else { &silence }, Instant::now());
+            if i >= open_after {
+                j.pull(&mut out);
+                played += out.iter().filter(|&&s| s > 0.0).count();
+            }
+        }
+        played / (CHANNELS * SAMPLE_RATE as usize / 1000)
+    }
+
+    #[test]
+    fn a_50ms_sound_plays_in_full() {
+        assert_eq!(sound_played_ms(50, 0), 50);
+    }
+
+    #[test]
+    fn a_20ms_click_plays_in_full() {
+        assert_eq!(sound_played_ms(20, 0), 20);
+    }
+
+    #[test]
+    fn a_20ms_click_plays_when_the_device_opens_150ms_late() {
+        assert_eq!(sound_played_ms(20, 15), 20);
+    }
+
+    #[test]
+    fn host_silence_alone_queues_nothing() {
+        let mut j = Jitter::default();
+        assert!(!j.push(&[0i16; 480 * CHANNELS], Instant::now()));
+        assert!(j.queue.is_empty());
+    }
+
+    #[test]
+    fn device_retries_wait_1_2_4_then_8_seconds() {
+        let delays: Vec<u64> = (0..6).map(|failures| retry_delay(failures).as_secs()).collect();
+        assert_eq!(delays, [1, 2, 4, 8, 8, 8]);
+        assert_eq!(retry_delay(u32::MAX), RETRY_MAX);
     }
 }
 
