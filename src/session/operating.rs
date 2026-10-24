@@ -158,6 +158,9 @@ pub enum Command {
     Pointer(u32, u32),
     /// Press and release this button (an RFB button bit) at the pointer.
     Click(u8),
+    /// Scroll whole wheel steps at the pointer: positive scrolls right and
+    /// down.
+    Scroll(i32, i32),
     /// Write the latest picture to this PNG file.
     Snapshot(PathBuf),
     /// End the session and exit.
@@ -181,7 +184,9 @@ pub fn parse_on_off(s: &str) -> Result<bool, String> {
 /// Input and output for scripted tests: `key <combo>` (key names joined by
 /// `+`, such as `cmd+ctrl+f`; see [`keymap::by_name`]), `type <text>` (the
 /// rest of the line), `pointer <x> <y>` (in points of the Mac display),
-/// `click [left|right]`, `snapshot <path.png>` and `quit`.
+/// `click [left|right]`, `scroll <dx> <dy>` (whole wheel steps at the
+/// pointer, positive scrolls right and down), `snapshot <path.png>` and
+/// `quit`.
 ///
 /// Blank lines and lines that start with `#` give `Ok(None)`. A `#` later
 /// in a line is part of it, as in `snapshot /tmp/a#1.png`.
@@ -249,6 +254,11 @@ pub fn parse_command(line: &str) -> Result<Option<Command>, String> {
                 _ => return Err(format!("click takes left or right, got {args:?}")),
             })));
         }
+        "scroll" => {
+            let [dx, dy] = args else { return Err("scroll needs dx and dy in wheel steps".into()) };
+            let steps = |v: &str| v.parse().map_err(|_| format!("scroll needs whole steps, got {v:?}"));
+            return Ok(Some(Command::Scroll(steps(dx)?, steps(dy)?)));
+        }
         "snapshot" => return Ok(Some(Command::Snapshot(need("a path")?.into()))),
         _ => return Err(format!("unknown command {cmd:?}")),
     };
@@ -290,7 +300,7 @@ pub(super) fn apply(shared: &Shared, fb: &Sender<Feedback>, new: OperatingPoint)
 /// points, so a click after a change of the backing scale lands on the
 /// same point of the Mac display.
 fn pointer_pixels(at: Option<(u32, u32)>, display: Option<DisplaySize>) -> Result<(u16, u16), &'static str> {
-    let at = at.ok_or("click needs a pointer command first")?;
+    let at = at.ok_or("click and scroll need a pointer command first")?;
     let display = display.ok_or("no display layout yet, so the pointer has no position")?;
     Ok(to_pixels(at, display))
 }
@@ -344,6 +354,10 @@ fn run_command(shared: &Shared, control: &Control, fb: &Sender<Feedback>, pointe
                 control.pointer(button, x, y);
                 control.pointer(0, x, y);
             }
+            Err(e) => tracing::warn!("control FIFO: {e}"),
+        },
+        Command::Scroll(dx, dy) => match pointer_pixels(*pointer, *shared.display.lock()) {
+            Ok((x, y)) => control.scroll(0, x, y, (dx, dy)),
             Err(e) => tracing::warn!("control FIFO: {e}"),
         },
         Command::Snapshot(path) => shared.sink.emit(Event::Snapshot(path)),
@@ -498,6 +512,9 @@ mod tests {
             "pointer 10 -5",
             "pointer 1.5 2",
             "click middle",
+            "scroll 1",
+            "scroll 1.5 0",
+            "scroll 1 2 3",
             "snapshot",
             "snapshot a.png b.png",
             "quit now",
@@ -520,6 +537,8 @@ mod tests {
         assert_eq!(cmd("click"), Command::Click(BTN_LEFT));
         assert_eq!(cmd("click left"), Command::Click(BTN_LEFT));
         assert_eq!(cmd("click right"), Command::Click(BTN_RIGHT));
+        assert_eq!(cmd("scroll 0 -3"), Command::Scroll(0, -3));
+        assert_eq!(cmd("scroll 2 0"), Command::Scroll(2, 0));
         assert_eq!(cmd("snapshot /tmp/run/1.png"), Command::Snapshot("/tmp/run/1.png".into()));
         assert_eq!(cmd("snapshot /tmp/a#1.png"), Command::Snapshot("/tmp/a#1.png".into()));
         assert_eq!(cmd("type #1"), Command::Type(vec![0x23, 0x31]));
@@ -580,6 +599,10 @@ mod tests {
 
         let long = "x".repeat(MAX_LINE) + "key c";
         writer.write_all(format!("pointer 100 50\n{long}\n").as_bytes()).unwrap();
+        assert_eq!(host.next(), Some(encrypted_pointer_event(&KEYS.key, 0, 200, 100)));
+        // One step right is a press and release of button 7.
+        writer.write_all(b"scroll 1 0\n").unwrap();
+        assert_eq!(host.next(), Some(encrypted_pointer_event(&KEYS.key, 0x40, 200, 100)));
         assert_eq!(host.next(), Some(encrypted_pointer_event(&KEYS.key, 0, 200, 100)));
         // The backing scale changes before the click: it lands on the same point.
         *shared.display.lock() = Some(DisplaySize { points: (1280, 720), pixels: (1280, 720) });

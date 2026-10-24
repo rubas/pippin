@@ -6,6 +6,7 @@ pub mod dialog;
 pub(crate) mod keymap;
 mod reconnect;
 mod render;
+mod scroll;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,14 +15,14 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
-use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
 use winit::window::{CursorIcon, CustomCursor, Window, WindowAttributes, WindowId};
 
-use crate::proto::messages::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SCROLL_DOWN, BTN_SCROLL_UP, DisplayRequest};
+use crate::proto::messages::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, DisplayRequest};
 use crate::session::{Config, CursorShape, Event, EventSink, Session};
 use reconnect::{OnEnd, Reconnector};
 use render::Renderer;
@@ -29,13 +30,6 @@ use render::Renderer;
 /// Settle time before asking the host to follow a window resize; each
 /// request restarts the host's encoder.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(500);
-/// The host scrolls exactly one point per wheel click it receives (the
-/// press/release pairs are its only scroll input), so scrolling is sent as
-/// one click per point. A mouse-wheel notch becomes this many points.
-const SCROLL_POINTS_PER_LINE: f64 = 32.0;
-/// Clicks sent per input event at most; the rest carries over, so a hard
-/// flick doesn't flood the control channel in one go.
-const SCROLL_MAX_CLICKS_PER_EVENT: f64 = 200.0;
 
 pub struct Options {
     pub title: String,
@@ -107,7 +101,7 @@ struct App {
 
     cursor_pos: Option<PhysicalPosition<f64>>,
     buttons: u8,
-    scroll_accum: f64,
+    scroll: scroll::Steps,
     modifiers: ModifiersState,
     /// Keysym sent for each held physical key, so releases match presses
     /// even if modifiers changed in between.
@@ -148,23 +142,23 @@ impl App {
         Some((x as u16, y as u16))
     }
 
-    fn send_pointer(&self, buttons: u8) {
-        if let (Some(s), Some(pos)) = (&self.session, self.cursor_pos)
-            && let Some((x, y)) = self.canvas_point(pos) {
-                s.pointer(buttons, x, y);
-            }
+    /// The session and the canvas pixel under the cursor.
+    fn at_cursor(&self) -> Option<(&Session, u16, u16)> {
+        let (x, y) = self.canvas_point(self.cursor_pos?)?;
+        Some((self.session.as_ref()?, x, y))
     }
 
-    /// Scrolls by `points` (positive is up), carrying any fraction.
-    fn scroll(&mut self, points: f64) {
-        self.scroll_accum += points;
-        let clicks = self.scroll_accum.trunc().clamp(-SCROLL_MAX_CLICKS_PER_EVENT, SCROLL_MAX_CLICKS_PER_EVENT);
-        self.scroll_accum -= clicks;
-        let bit = if clicks > 0.0 { BTN_SCROLL_UP } else { BTN_SCROLL_DOWN };
-        for _ in 0..clicks.abs() as u32 {
-            // Each press/release pair is one wheel click on the host.
-            self.send_pointer(self.buttons | bit);
-            self.send_pointer(self.buttons);
+    fn send_pointer(&self, buttons: u8) {
+        if let Some((s, x, y)) = self.at_cursor() {
+            s.pointer(buttons, x, y);
+        }
+    }
+
+    fn scroll(&mut self, delta: MouseScrollDelta, phase: TouchPhase) {
+        let scale = self.window.as_ref().map_or(1.0, |w| w.scale_factor());
+        let steps = self.scroll.add(scroll::points(delta, scale), phase);
+        if let Some((s, x, y)) = self.at_cursor() {
+            s.scroll(self.buttons, x, y, steps);
         }
     }
 
@@ -274,7 +268,7 @@ impl App {
         // keys and buttons with it.
         self.pressed.clear();
         self.buttons = 0;
-        self.scroll_accum = 0.0;
+        self.scroll = scroll::Steps::default();
         self.cursors.clear();
         if let Some(w) = &self.window {
             w.set_cursor_visible(true);
@@ -442,17 +436,7 @@ impl ApplicationHandler<Tagged> for App {
                 }
                 self.send_pointer(self.buttons);
             }
-            WindowEvent::MouseWheel { delta, .. } => {
-                let points = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y as f64 * SCROLL_POINTS_PER_LINE,
-                    // Physical pixels → logical points, so the remote
-                    // content tracks the fingers 1:1.
-                    MouseScrollDelta::PixelDelta(p) => {
-                        p.y / self.window.as_ref().map_or(1.0, |w| w.scale_factor())
-                    }
-                };
-                self.scroll(points);
-            }
+            WindowEvent::MouseWheel { delta, phase, .. } => self.scroll(delta, phase),
             _ => {}
         }
     }
@@ -517,7 +501,7 @@ pub fn run(event_loop: &mut EventLoop<Tagged>, cfg: Config, opts: Options) -> Re
         resize_due: None,
         cursor_pos: None,
         buttons: 0,
-        scroll_accum: 0.0,
+        scroll: scroll::Steps::default(),
         modifiers: ModifiersState::empty(),
         pressed: HashMap::new(),
         cursors: HashMap::new(),
