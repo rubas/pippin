@@ -352,6 +352,23 @@ mod tests {
         Ev::modifier(SuperLeft, NamedKey::Super)
     }
 
+    /// A Mod3 key of Neo 2: ISO_Level3_Shift, which winit names AltGraph.
+    fn neo_mod3(code: KeyCode) -> Ev {
+        Ev::named(code, NamedKey::AltGraph, None)
+    }
+
+    /// A Mod4 key of Neo 2: ISO_Level5_Shift, which winit does not name.
+    fn neo_mod4(code: KeyCode) -> Ev {
+        let key = Key::Unidentified(NativeKey::Xkb(XK_ISO_LEVEL5_SHIFT));
+        let location = if code == AltRight { KeyLocation::Right } else { KeyLocation::Standard };
+        Ev { location, logical: key.clone(), base: key, ..Ev::named(code, NamedKey::AltGraph, None) }
+    }
+
+    /// Mod4+s of Neo 2, which has i at the base level of this key.
+    fn neo_left() -> Ev {
+        Ev { base: ch("i"), ..Ev::named(KeyS, NamedKey::ArrowLeft, None) }
+    }
+
     /// Presses each key of `chord` in turn, holding the ones before it, then
     /// releases them in reverse order, and returns what the Mac gets.
     fn chord(kb: &mut Keyboard, chord: &[Ev]) -> Vec<Out> {
@@ -566,16 +583,26 @@ mod tests {
     }
 
     #[test]
+    fn neo_mod3_on_caps_lock_or_hash_types_layer_3_and_never_reaches_the_mac() {
+        for code in [CapsLock, Backslash] {
+            assert_eq!(typed(vec![vec![neo_mod3(code)]]), [], "{code:?} alone");
+            // Neo has a at the base level of this key, and { on layer 3.
+            assert_eq!(typed(vec![vec![neo_mod3(code), Ev::text(KeyD, "a", "{")]]), tap('{'), "{code:?}");
+        }
+    }
+
+    #[test]
+    fn neo_mod4_on_less_than_or_right_alt_never_reaches_the_mac_and_mod4_s_is_left() {
+        for code in [IntlBackslash, AltRight] {
+            assert_eq!(typed(vec![vec![neo_mod4(code)]]), [], "{code:?} alone");
+            assert_eq!(typed(vec![vec![neo_mod4(code), neo_left()]]), [Out::Down(0xff51), Out::Up(0xff51)], "{code:?}");
+        }
+    }
+
+    #[test]
     fn ctrl_with_the_neo_mod4_left_arrow_sends_ctrl_left() {
-        let mod4 = Ev {
-            logical: Key::Unidentified(NativeKey::Xkb(XK_ISO_LEVEL5_SHIFT)),
-            base: Key::Unidentified(NativeKey::Xkb(XK_ISO_LEVEL5_SHIFT)),
-            ..Ev::named(IntlBackslash, NamedKey::AltGraph, None)
-        };
-        // Neo has i at the base level of this key.
-        let left = Ev { base: ch("i"), ..Ev::named(KeyS, NamedKey::ArrowLeft, None) };
         assert_eq!(
-            typed(vec![vec![Ev::modifier(ControlLeft, NamedKey::Control), mod4, left]]),
+            typed(vec![vec![Ev::modifier(ControlLeft, NamedKey::Control), neo_mod4(IntlBackslash), neo_left()]]),
             [Out::Down(XK_CONTROL_L), Out::Down(0xff51), Out::Up(0xff51), Out::Up(XK_CONTROL_L)]
         );
     }
