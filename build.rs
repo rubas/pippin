@@ -35,6 +35,8 @@ fn main() {
         .allowlist_function("av_free")
         .allowlist_function("av_strerror")
         .allowlist_function("av_get_pix_fmt_name")
+        .allowlist_function("av_color_range_name")
+        .allowlist_function("av_color_space_name")
         .allowlist_function("av_log_set_level")
         .allowlist_type("AVPixelFormat")
         .allowlist_type("AVHWDeviceType")
@@ -49,6 +51,8 @@ fn main() {
         .allowlist_var("AVERROR_.*")
         .constified_enum_module("AVPixelFormat")
         .constified_enum_module("AVHWDeviceType")
+        .constified_enum_module("AVColorRange")
+        .constified_enum_module("AVColorSpace")
         .constified_enum_module("AVCodecID")
         .layout_tests(false)
         .generate_comments(false);

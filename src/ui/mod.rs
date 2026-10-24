@@ -5,6 +5,7 @@
 pub mod dialog;
 mod inhibit;
 pub(crate) mod keymap;
+mod pointer;
 mod reconnect;
 mod render;
 mod scroll;
@@ -15,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition};
+use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{ModifiersState, PhysicalKey};
@@ -27,6 +28,7 @@ use crate::proto::messages::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, DisplayRequest};
 use crate::session::{Config, CursorShape, Event, EventSink, Session};
 use inhibit::ShortcutInhibitor;
 use keymap::{KeyInput, Keyboard, Out};
+use pointer::Track;
 use reconnect::{OnEnd, Reconnector};
 use render::Renderer;
 
@@ -104,7 +106,8 @@ struct App {
     last_request: Option<DisplayRequest>,
     resize_due: Option<Instant>,
 
-    cursor_pos: Option<PhysicalPosition<f64>>,
+    /// The local pointer over the window, kept after it leaves.
+    pointer: Option<Track>,
     buttons: u8,
     scroll: scroll::Steps,
     modifiers: ModifiersState,
@@ -135,19 +138,10 @@ impl App {
         }
     }
 
-    /// Window position → canvas pixel, clamped to the canvas.
-    fn canvas_point(&self, pos: PhysicalPosition<f64>) -> Option<(u16, u16)> {
-        let r = self.renderer.as_ref()?;
-        let vp = r.viewport()?;
-        let (iw, ih) = r.image_size()?;
-        let x = ((pos.x as f32 - vp.x) / vp.w * iw as f32).clamp(0.0, iw.saturating_sub(1) as f32);
-        let y = ((pos.y as f32 - vp.y) / vp.h * ih as f32).clamp(0.0, ih.saturating_sub(1) as f32);
-        Some((x as u16, y as u16))
-    }
-
     /// The session and the canvas pixel under the cursor.
     fn at_cursor(&self) -> Option<(&Session, u16, u16)> {
-        let (x, y) = self.canvas_point(self.cursor_pos?)?;
+        let r = self.renderer.as_ref()?;
+        let (x, y) = pointer::canvas(self.pointer?.pos, r.viewport()?, r.image_size()?);
         Some((self.session.as_ref()?, x, y))
     }
 
@@ -421,16 +415,28 @@ impl ApplicationHandler<Tagged> for App {
                         tracing::trace!("uploaded {n} tiles in {:.2} ms", started.elapsed().as_secs_f64() * 1000.0);
                     }
                 }
-                if let Some(r) = &mut self.renderer {
-                    r.render();
+                if let Some(r) = &mut self.renderer
+                    && r.render()
+                    && let Some(s) = &self.session
+                {
+                    s.presented();
                 }
             }
             WindowEvent::Focused(false) => self.release_all(),
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => self.key(&event),
+            WindowEvent::CursorEntered { .. } => self.pointer = None,
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor_pos = Some(position);
+                let now = Instant::now();
+                self.pointer = Some(self.pointer.map_or(Track::at(position, now), |t| t.moved(position, now)));
                 self.send_pointer(self.buttons);
+            }
+            WindowEvent::CursorLeft { .. } => {
+                let (size, now) = (self.window.as_ref().map(|w| w.inner_size()), Instant::now());
+                if let Some(exit) = self.pointer.zip(size).and_then(|(t, size)| t.exit(size, now)) {
+                    self.pointer = Some(Track::at(exit, now));
+                    self.send_pointer(self.buttons);
+                }
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let bit = match button {
@@ -510,7 +516,7 @@ pub fn run(event_loop: &mut EventLoop<Tagged>, cfg: Config, opts: Options) -> Re
         error: None,
         last_request: None,
         resize_due: None,
-        cursor_pos: None,
+        pointer: None,
         buttons: 0,
         scroll: scroll::Steps::default(),
         modifiers: ModifiersState::empty(),

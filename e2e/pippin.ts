@@ -1,11 +1,16 @@
 // One headless pippin session, driven through its control FIFO (README,
-// Development). The password goes to pippin on stdin only.
+// Development). The password goes to pippin on stdin only. pippin runs in a
+// container with its own LAN address (container.ts).
 
-import { closeSync, constants, existsSync, openSync, rmSync, writeSync } from "node:fs";
+import { closeSync, constants, existsSync, mkdirSync, openSync, rmSync, writeSync } from "node:fs";
+import { userInfo } from "node:os";
+import { dirname } from "node:path";
+import { dockerRun } from "./container";
 import { capture, spawn } from "./proc";
 import type { Login } from "./login";
 
-const ROOT = `${import.meta.dir}/..`;
+// A clean path: the container has the binary, but no e2e directory to walk up from.
+const ROOT = dirname(import.meta.dir);
 // An explicit target dir, so that a CARGO_TARGET_DIR cannot move the binary.
 const TARGET = `${ROOT}/target`;
 const BINARY = `${TARGET}/release/pippin`;
@@ -19,11 +24,6 @@ export async function build(log: string): Promise<void> {
   });
   await Bun.write(log, out.stderr);
   if (out.code !== 0) throw new Error(`cargo build failed; see ${log}`);
-}
-
-/** pippin binds fixed UDP ports, so only one session runs on a machine. */
-export async function running(): Promise<boolean> {
-  return (await spawn(["pgrep", "-x", "pippin"])).code === 0;
 }
 
 /** The pictures that pippin decoded from `fromS` to `toS`, in Unix seconds, from --stats-json. */
@@ -40,7 +40,8 @@ export class Session {
 
   private constructor(
     private readonly child: Bun.Subprocess,
-    private readonly fifo: string,
+    private readonly container: string,
+    private readonly dir: string,
     private readonly fd: number,
     readonly out: string,
   ) {}
@@ -51,28 +52,28 @@ export class Session {
    * else the Mac creates a virtual display of SIZE for it.
    */
   static async start(ip: string, login: Login, out: string, macDisplay = false): Promise<Session> {
-    const fifo = `${process.env.XDG_RUNTIME_DIR}/pippin-e2e-${process.pid}.ctl`;
-    rmSync(fifo, { force: true });
+    const name = `pippin-e2e-${process.pid}`;
+    // The container sees only this directory of XDG_RUNTIME_DIR, which is
+    // private, as pippin wants the directory of its FIFO.
+    const dir = `${process.env.XDG_RUNTIME_DIR}/${name}`;
+    rmSync(dir, { recursive: true, force: true });
+    mkdirSync(dir, { mode: 0o700 });
+    const fifo = `${dir}/pippin.ctl`;
     await capture(["mkfifo", "-m", "600", fifo]);
     // Read-write, like pippin: the open does not wait for a reader, and a
     // write waits in the pipe until pippin reads it.
     const fd = openSync(fifo, constants.O_RDWR | constants.O_NONBLOCK);
     const log = openSync(`${out}/pippin.log`, "a");
-    const argv = [BINARY, "--headless", ip, "--user", login.username, "--password-stdin"];
+    const argv: [string, ...string[]] = [BINARY, "--headless", ip, "--user", login.username, "--password-stdin"];
     argv.push("--session", "share", "-v", "--stats-json", `${out}/stats.jsonl`);
     argv.push(...(macDisplay ? ["--no-virtual-display"] : ["--size", SIZE]));
-    // PIPPIN_PASSWORD would win over stdin.
-    const { PIPPIN_PASSWORD: _, ...env } = process.env;
-    const child = Bun.spawn(argv, {
-      stdin: "pipe",
-      stdout: log,
-      stderr: log,
-      env: { ...env, PIPPIN_CONTROL_FIFO: fifo },
-    });
+    const { uid, gid } = userInfo();
+    const docker = dockerRun(name, `${uid}:${gid}`, argv, [dir, out], { PIPPIN_CONTROL_FIFO: fifo });
+    const child = Bun.spawn(docker, { stdin: "pipe", stdout: log, stderr: log });
     closeSync(log);
     child.stdin.write(`${login.password}\n`);
     await child.stdin.end();
-    return new Session(child, fifo, fd, out);
+    return new Session(child, name, dir, fd, out);
   }
 
   send(command: string): void {
@@ -103,12 +104,13 @@ export class Session {
     return code ?? -1;
   }
 
-  /** Ends pippin, if it still runs, and removes the FIFO. */
+  /** Ends pippin, if it still runs, and removes its container and the FIFO. */
   close(): void {
-    if (this.child.exitCode === null) this.child.kill();
     if (this.closed) return;
     this.closed = true;
+    // A kill of the docker client alone can leave the container running.
+    Bun.spawnSync(["docker", "rm", "--force", this.container], { stdout: "ignore", stderr: "ignore" });
     closeSync(this.fd);
-    rmSync(this.fifo, { force: true });
+    rmSync(this.dir, { recursive: true, force: true });
   }
 }

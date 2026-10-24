@@ -19,10 +19,12 @@
 //! per line; see [`parse_command`]. For scripted tests, it also sends keys
 //! and pointer input to the Mac and asks for snapshots of the picture.
 
+use std::ffi::{CString, OsStr};
 use std::fmt;
-use std::io::Read;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+use std::io::{Error, ErrorKind, Read};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -368,23 +370,69 @@ fn run_command(shared: &Shared, control: &Control, fb: &Sender<Feedback>, pointe
     }
 }
 
-/// Creates the FIFO at `path` if it is missing, and opens it.
+/// Creates the FIFO at `path` if it is missing, and opens it. Whoever can
+/// write to the FIFO drives the session, so pippin opens only a FIFO, not a
+/// symlink, that belongs to this user and has no group or other
+/// permissions, in a directory with the same rule, such as
+/// `$XDG_RUNTIME_DIR`.
 pub(super) fn open_fifo(path: &Path) -> std::io::Result<std::fs::File> {
-    if !path.exists() {
-        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        // SAFETY: a valid NUL-terminated path.
-        if unsafe { libc::mkfifo(c.as_ptr(), 0o600) } != 0 {
-            return Err(std::io::Error::last_os_error());
+    // Split at the last slash by hand: `Path::file_name` drops a trailing
+    // slash, and a writer cannot open `pippin.ctl/`.
+    let bytes = path.as_os_str().as_bytes();
+    let (dir_path, name) = match bytes.iter().rposition(|&b| b == b'/') {
+        Some(0) => (Path::new("/"), &bytes[1..]),
+        Some(i) => (Path::new(OsStr::from_bytes(&bytes[..i])), &bytes[i + 1..]),
+        None => (Path::new("."), bytes),
+    };
+    if name.is_empty() {
+        return Err(Error::new(ErrorKind::InvalidInput, "the path has no file name"));
+    }
+    let name = CString::new(name).map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
+    // The FIFO is created and opened relative to this descriptor, so the
+    // checks hold for the directory that was checked. O_DIRECTORY refuses a
+    // parent FIFO instead of waiting for its writer.
+    let dir = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY).open(dir_path)?;
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    only_for(uid, &dir.metadata()?).map_err(|why| {
+        Error::other(format!("the directory {} {why}; use a private directory such as $XDG_RUNTIME_DIR", dir_path.display()))
+    })?;
+    // SAFETY: an open directory descriptor and a NUL-terminated name.
+    if unsafe { libc::mkfifoat(dir.as_raw_fd(), name.as_ptr(), 0o600) } != 0 {
+        let e = Error::last_os_error();
+        if e.kind() != ErrorKind::AlreadyExists {
+            return Err(e);
         }
     }
     // Read-write, so opening doesn't wait for a writer and the FIFO never
     // reads as closed between writers.
-    let f = std::fs::OpenOptions::new().read(true).write(true).custom_flags(libc::O_NONBLOCK).open(path)?;
-    if !f.metadata()?.file_type().is_fifo() {
-        return Err(std::io::Error::other("not a FIFO"));
+    let flags = libc::O_RDWR | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: an open directory descriptor and a NUL-terminated name.
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        let e = Error::last_os_error();
+        return Err(if e.raw_os_error() == Some(libc::ELOOP) { Error::other("the path is a symlink") } else { e });
     }
+    // SAFETY: openat returned a new descriptor that nothing else owns.
+    let f = unsafe { std::fs::File::from_raw_fd(fd) };
+    let meta = f.metadata()?;
+    if !meta.file_type().is_fifo() {
+        return Err(Error::other("not a FIFO"));
+    }
+    only_for(uid, &meta).map_err(|why| Error::other(format!("the FIFO {why}")))?;
     Ok(f)
+}
+
+/// Why another user than `uid` has access to the file of `meta`, if one does.
+fn only_for(uid: u32, meta: &std::fs::Metadata) -> Result<(), String> {
+    if meta.uid() != uid {
+        return Err(format!("belongs to uid {}, not to uid {uid}", meta.uid()));
+    }
+    let mode = meta.mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(format!("has mode {mode:03o}, which gives group or other users access"));
+    }
+    Ok(())
 }
 
 /// The longest control line. A longer one is dropped up to its newline.
@@ -433,7 +481,7 @@ pub(super) fn control_fifo(shared: Arc<Shared>, control: Arc<Control>, mut f: st
         }
         let n = match f.read(&mut buf) {
             Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::Interrupted => 0,
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => 0,
             Err(e) => {
                 tracing::warn!("control FIFO: {e}");
                 return;
@@ -587,8 +635,8 @@ mod tests {
 
         let (shared, control, mut host, events) = connected(Some((2560, 1440)));
         *shared.display.lock() = Some(DisplaySize { points: (1280, 720), pixels: (2560, 1440) });
-        let path = std::env::temp_dir().join(format!("pippin-fifo-input-test-{}", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let dir = PrivateDir::new("fifo-input-test");
+        let path = dir.join("pippin.ctl");
         let fifo = open_fifo(&path).unwrap();
         let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         let (fb, _fb_rx) = crossbeam_channel::unbounded();
@@ -614,7 +662,6 @@ mod tests {
         assert!(matches!(events.recv().unwrap(), Event::Closed(None)));
         shared.stop.store(true, std::sync::atomic::Ordering::Release);
         reader.join().unwrap();
-        std::fs::remove_file(&path).unwrap();
     }
 
     /// The operating point and the events after `render_scale 0.5`.
@@ -639,13 +686,90 @@ mod tests {
         assert!(events.is_empty());
     }
 
+    /// A directory that only this user can enter. Dropping it removes it.
+    struct PrivateDir(PathBuf);
+
+    impl PrivateDir {
+        fn new(name: &str) -> Self {
+            use std::os::unix::fs::DirBuilderExt;
+            let path = std::env::temp_dir().join(format!("pippin-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+            Self(path)
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for PrivateDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn refusal(path: &Path) -> String {
+        open_fifo(path).unwrap_err().to_string()
+    }
+
     #[test]
-    fn opens_fifo_without_a_writer() {
-        let path = std::env::temp_dir().join(format!("pippin-fifo-test-{}", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+    fn refuses_a_symlink_to_a_private_fifo() {
+        let dir = PrivateDir::new("fifo-symlink-test");
+        drop(open_fifo(&dir.join("real.ctl")).unwrap());
+        std::os::unix::fs::symlink(dir.join("real.ctl"), dir.join("link.ctl")).unwrap();
+        assert_eq!(refusal(&dir.join("link.ctl")), "the path is a symlink");
+    }
+
+    #[test]
+    fn refuses_a_group_writable_fifo() {
+        let dir = PrivateDir::new("fifo-group-test");
+        let path = dir.join("pippin.ctl");
+        drop(open_fifo(&path).unwrap());
+        chmod(&path, 0o620);
+        assert_eq!(refusal(&path), "the FIFO has mode 620, which gives group or other users access");
+    }
+
+    #[test]
+    fn refuses_a_fifo_in_a_world_writable_directory() {
+        let dir = PrivateDir::new("fifo-open-dir-test");
+        chmod(&dir.0, 0o777);
+        let path = dir.join("pippin.ctl");
+        let want = format!("the directory {} has mode 777, which gives group or other users access", dir.0.display());
+        assert!(refusal(&path).starts_with(&want));
+        // pippin creates nothing in a directory that it refuses.
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn refuses_a_path_with_a_trailing_slash() {
+        let dir = PrivateDir::new("fifo-slash-test");
+        let path = dir.join("pippin.ctl");
+        assert_eq!(refusal(&dir.0.join("pippin.ctl/")), "the path has no file name");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn refuses_a_fifo_as_the_directory_without_waiting() {
+        let dir = PrivateDir::new("fifo-parent-test");
+        let pipe = dir.join("pipe");
+        drop(open_fifo(&pipe).unwrap());
+        let e = open_fifo(&pipe.join("pippin.ctl")).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::ENOTDIR));
+    }
+
+    #[test]
+    fn opens_a_private_fifo_without_a_writer() {
+        let dir = PrivateDir::new("fifo-test");
+        let path = dir.join("pippin.ctl");
         let mut f = open_fifo(&path).expect("created and opened");
         let mut buf = [0u8; 16];
-        assert_eq!(f.read(&mut buf).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(f.read(&mut buf).unwrap_err().kind(), ErrorKind::WouldBlock);
         std::fs::OpenOptions::new().write(true).open(&path).unwrap().write_all(b"fps 30\n").unwrap();
         let n = f.read(&mut buf).unwrap();
         assert_eq!(parse_command(std::str::from_utf8(&buf[..n]).unwrap()), set(Lever::Fps(Fps::Thirty)));
@@ -653,8 +777,7 @@ mod tests {
         // A regular file is refused rather than read in a busy loop.
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, b"").unwrap();
-        assert!(open_fifo(&path).is_err());
-        std::fs::remove_file(&path).unwrap();
+        assert_eq!(refusal(&path), "not a FIFO");
     }
 
     #[test]
