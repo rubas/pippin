@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use anyhow::{Result, anyhow, bail};
 
+use super::colour::Colour;
 use super::ffi::{self, AVPixelFormat as PixFmt};
 
 /// One image plane: `rows` rows of `stride` bytes, of which the first
@@ -87,6 +88,8 @@ pub struct Picture {
     pub chroma_width: u32,
     pub chroma_height: u32,
     pub layout: Layout,
+    /// How the samples map to RGB.
+    pub colour: Colour,
     frame: FrameRef,
     /// The decoder flagged concealment or a reference error in this frame.
     pub damaged: bool,
@@ -124,7 +127,17 @@ impl Picture {
                 ptr::write_bytes((*f).data[i], v, (*f).linesize[i] as usize * rows as usize);
             }
             let frame = FrameRef(f);
-            Picture { pts: 0, width, height, chroma_width: cw, chroma_height: ch, layout: Layout::Planar, frame, damaged: false }
+            Picture {
+                pts: 0,
+                width,
+                height,
+                chroma_width: cw,
+                chroma_height: ch,
+                layout: Layout::Planar,
+                colour: Colour::default(),
+                frame,
+                damaged: false,
+            }
         }
     }
 }
@@ -210,6 +223,8 @@ pub struct Decoder {
     /// Pixel format of hardware frames, for hardware backends.
     hw_fmt: Option<PixFmt::Type>,
     warned_format: bool,
+    /// The colour of the last picture, logged when it changes.
+    colour: Option<Colour>,
     broken: bool,
     /// See [`Decoder::set_lenient`].
     lenient: bool,
@@ -323,6 +338,7 @@ impl Decoder {
                 backend,
                 hw_fmt: None,
                 warned_format: false,
+                colour: None,
                 broken: false,
                 lenient: false,
                 transfer_failures: 0,
@@ -417,6 +433,7 @@ impl Decoder {
             let f = self.frame;
             let damaged = (*f).decode_error_flags != 0 || ((*f).flags & ffi::AV_FRAME_FLAG_CORRUPT as i32) != 0;
             let pts = (*f).pts;
+            let colour = self.colour_of(f);
             // For hardware frames: whether the stream is 4:4:4. Drivers may
             // download other bit depths under an 8-bit format, so only
             // streams software decoding could show are accepted.
@@ -486,9 +503,31 @@ impl Decoder {
                 chroma_width: cw,
                 chroma_height: ch,
                 layout,
+                colour,
                 frame,
                 damaged,
             })
+        }
+    }
+
+    /// The colour of decoded frame `f`. When it changes, logs it with what
+    /// FFmpeg reports. A downloaded frame does not keep these fields.
+    unsafe fn colour_of(&mut self, f: *const ffi::AVFrame) -> Colour {
+        unsafe {
+            let (range, space) = ((*f).color_range, (*f).colorspace);
+            let colour = Colour::from_ffmpeg(range, space);
+            if self.colour != Some(colour) {
+                self.colour = Some(colour);
+                let name = |p: *const std::os::raw::c_char| {
+                    if p.is_null() { "unknown".into() } else { CStr::from_ptr(p).to_string_lossy() }
+                };
+                tracing::info!(
+                    "stream colour: range {}, matrix {}; converting as {colour:?}",
+                    name(ffi::av_color_range_name(range)),
+                    name(ffi::av_color_space_name(space)),
+                );
+            }
+            colour
         }
     }
 

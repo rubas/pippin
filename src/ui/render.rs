@@ -1,12 +1,14 @@
 //! Draws the decoded canvas: the decoder's planes uploaded as-is (R8, Rg8
-//! or Rgba8) and converted to RGB in a fragment shader, letterboxed into
-//! the window.
+//! or Rgba8) and converted to RGB in a fragment shader with the stream's
+//! colour, letterboxed into the window.
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use wgpu::util::DeviceExt;
 use winit::window::Window;
 
+use crate::video::colour::Colour;
 use crate::video::decoder::{Layout, Picture, PlaneRef};
 
 const SHADER: &str = r#"
@@ -14,6 +16,13 @@ const SHADER: &str = r#"
 @group(0) @binding(1) var u_tex: texture_2d<f32>;
 @group(0) @binding(2) var v_tex: texture_2d<f32>;
 @group(0) @binding(3) var samp: sampler;
+
+// The stream's colour: RGB = rows · (sample − offset); see Conversion.
+struct Conversion {
+    rows: array<vec4<f32>, 3>,
+    offset: vec4<f32>,
+};
+@group(0) @binding(4) var<uniform> conv: Conversion;
 
 // Channel of each texture holding Y, U and V; set per layout. Textures
 // shared between components are bound more than once.
@@ -36,16 +45,13 @@ fn vs(@builtin(vertex_index) i: u32) -> Out {
     return o;
 }
 
-// BT.709, full range.
 fn rgb_at(i: Out) -> vec4<f32> {
-    let y = textureSample(y_tex, samp, i.uv)[y_ch];
-    let cb = textureSample(u_tex, samp, i.uv)[u_ch] - 0.5;
-    let cr = textureSample(v_tex, samp, i.uv)[v_ch] - 0.5;
-    let rgb = vec3<f32>(
-        y + 1.5748 * cr,
-        y - 0.187324 * cb - 0.468124 * cr,
-        y + 1.8556 * cb,
-    );
+    let yuv = vec3<f32>(
+        textureSample(y_tex, samp, i.uv)[y_ch],
+        textureSample(u_tex, samp, i.uv)[u_ch],
+        textureSample(v_tex, samp, i.uv)[v_ch],
+    ) - conv.offset.xyz;
+    let rgb = vec3<f32>(dot(conv.rows[0].xyz, yuv), dot(conv.rows[1].xyz, yuv), dot(conv.rows[2].xyz, yuv));
     return vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }
 
@@ -100,6 +106,9 @@ pub struct Renderer {
     dimmed: bool,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    /// The uniform Conversion of `colour`.
+    conversion: wgpu::Buffer,
+    colour: Colour,
     planes: Option<Planes>,
     /// Canvas size announced by the host; tiles stack into this.
     canvas: Option<(u32, u32)>,
@@ -180,6 +189,16 @@ impl Renderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -219,6 +238,12 @@ impl Renderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let colour = Colour::default();
+        let conversion = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("conversion"),
+            contents: bytemuck::bytes_of(&colour.conversion()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
         Ok(Self {
             surface,
             device,
@@ -229,6 +254,8 @@ impl Renderer {
             dimmed: false,
             layout,
             sampler,
+            conversion,
+            colour,
             planes: None,
             canvas: None,
         })
@@ -312,6 +339,7 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 1, resource: view(1) },
                 wgpu::BindGroupEntry { binding: 2, resource: view(2) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 4, resource: self.conversion.as_entire_binding() },
             ],
         });
         Planes { width, height, layout, sizes, textures, bind_group }
@@ -340,6 +368,10 @@ impl Renderer {
             let sizes: Vec<_> = (0..n).map(|i| (pic.plane(i).width, tex_h(pic.plane(i)))).collect();
             tracing::debug!("canvas textures {}x{}, {:?} {sizes:?}", pic.width, height, pic.layout);
             self.planes = Some(self.make_planes(pic.width, height, pic.layout, sizes));
+        }
+        if pic.colour != self.colour {
+            self.colour = pic.colour;
+            self.queue.write_buffer(&self.conversion, 0, bytemuck::bytes_of(&pic.colour.conversion()));
         }
         let planes = self.planes.as_ref().unwrap();
         for (i, t) in planes.textures.iter().enumerate() {
@@ -413,5 +445,21 @@ impl Renderer {
         self.queue.submit([enc.finish()]);
         self.queue.present(frame);
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::video::colour::Conversion;
+    use wgpu::naga;
+
+    #[test]
+    fn the_shader_compiles_and_reads_the_conversion_as_rust_writes_it() {
+        let module = naga::front::wgsl::parse_str(SHADER).unwrap();
+        naga::valid::Validator::new(Default::default(), Default::default()).validate(&module).unwrap();
+        let (_, conv) = module.global_variables.iter().find(|(_, g)| g.name.as_deref() == Some("conv")).unwrap();
+        let size = module.types[conv.ty].inner.size(module.to_ctx());
+        assert_eq!(size as usize, size_of::<Conversion>());
     }
 }
