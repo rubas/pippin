@@ -66,6 +66,17 @@ impl Layout {
             _ => 1,
         }
     }
+
+    /// The byte of a texel that holds Y, U and V. Component `c` is in plane
+    /// `min(c, planes() - 1)`: a plane that holds more than one component
+    /// holds all the ones after it.
+    pub fn channels(self) -> [u32; 3] {
+        match self {
+            Layout::Planar => [0, 0, 0],
+            Layout::SemiPlanar => [0, 0, 1],
+            Layout::Vuyx => [2, 1, 0],
+        }
+    }
 }
 
 /// A decoded picture.
