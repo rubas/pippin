@@ -70,12 +70,12 @@ if [ ! -x ${bin} ]; then
   mkdir -p ${TOOLS}
   rm -f ${TOOLS}/${name}-*(N)
   src=$(mktemp -d)
+  trap 'rm -rf -- "$src"' EXIT
   cat >$src/${name}.swift <<'SWIFT'
 ${source}
 SWIFT
   swiftc -O -o $src/${name} $src/${name}.swift
   mv $src/${name} ${bin}
-  rm -r $src
 fi
 `);
   return readFile(bin);

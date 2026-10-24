@@ -85,13 +85,12 @@ async function onlyVdisplay(ctx: Context): Promise<void> {
   await ctx.guest.put("displaycfg", await swiftTool("displaycfg"), "755");
   await ctx.guest.sh("./displaycfg");
   const only = (cg: string[]) => cg.length === 1 && /^cg \S+ \d+x\d+\+0\+0 vendor 0x1ab2 active main$/.test(cg[0]!);
-  const cg = async (timeoutMs?: number) =>
-    (await ctx.guest.displays(timeoutMs)).split("\n").filter((l) => l.startsWith("cg "));
-  const lines = await waitFor("vdisplay as the only display", 10_000, async (left) => {
-    const lines = await cg(left);
-    return only(lines) ? lines : undefined;
-  }).catch(() => cg());
-  ctx.check("only vdisplay", only(lines), lines.join("; "));
+  let cg: string[] = [];
+  await waitFor("vdisplay as the only display", 10_000, async (left) => {
+    cg = (await ctx.guest.displays(left)).split("\n").filter((l) => l.startsWith("cg "));
+    return only(cg) || undefined;
+  }).catch(() => undefined);
+  ctx.check("only vdisplay", only(cg), cg.join("; "));
 }
 
 // While pippin is connected, its display must be the main display, and
@@ -104,13 +103,17 @@ function checkMain(ctx: Context, displays: string): void {
 }
 
 const APP = "TextEdit";
+// The fullscreen transition takes about 1 s, and the snapshot comes 10 s
+// after the key. pippin must still decode pictures in the last seconds
+// before it.
+const SETTLED_S = 3;
 
 function fullscreen(vdisplay: boolean): Scenario {
   return {
     about: `put a ${APP} window into native fullscreen, ${vdisplay ? "with" : "without"} the mini's vdisplay`,
     async run(ctx) {
       let window: string | undefined, full: string | undefined;
-      let windowAt = 0, fullAt = 0;
+      let fullAt = 0;
       if (vdisplay) {
         await startVdisplay(ctx);
         await onlyVdisplay(ctx);
@@ -125,7 +128,6 @@ function fullscreen(vdisplay: boolean): Scenario {
         await Bun.sleep(3000);
         ctx.check("app runs", await ctx.guest.ok(`pgrep -qx ${APP}`), APP);
         window = await session.snapshot("1-window");
-        windowAt = Date.now() / 1000;
         await Bun.write(`${ctx.out}/windows-window.txt`, await ctx.guest.jxa("windows.js", [APP]));
         session.send("key ctrl+cmd+f");
         await Bun.sleep(10_000);
@@ -137,12 +139,18 @@ function fullscreen(vdisplay: boolean): Scenario {
         await checkLit(ctx, "fullscreen frame", full);
       });
       // A frozen stream would show an old picture: the fullscreen snapshot
-      // must differ from the window, and pippin must have decoded new
-      // pictures in between. The stats are complete once pippin quit.
-      if (window && full) {
+      // must differ from the window, and pippin must still decode pictures
+      // after the transition. The stats are complete once pippin quit.
+      if (!window || !full) {
+        ctx.check("fullscreen picture is new", false, "no snapshot of the window or of the fullscreen");
+      } else {
         const pixels = await differingPixels(window, full);
-        const pictures = await decoded(ctx.out, windowAt, fullAt);
-        ctx.check("fullscreen picture is new", pixels > 0 && pictures > 0, `${pixels} pixels differ, ${pictures} pictures decoded`);
+        const pictures = await decoded(ctx.out, fullAt - SETTLED_S, fullAt);
+        ctx.check(
+          "fullscreen picture is new",
+          pixels > 0 && pictures > 0,
+          `${pixels} pixels differ, ${pictures} pictures decoded in the ${SETTLED_S} s before the fullscreen snapshot`,
+        );
       }
     },
   };
