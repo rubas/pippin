@@ -7,6 +7,8 @@ export type Options = {
   stdin?: string | Uint8Array;
   env?: Record<string, string>;
   cwd?: string;
+  /** Kills the child after this time. */
+  timeoutMs?: number;
 };
 
 export async function spawn(argv: string[], opts: Options = {}): Promise<Output> {
@@ -16,6 +18,7 @@ export async function spawn(argv: string[], opts: Options = {}): Promise<Output>
     stderr: "pipe",
     cwd: opts.cwd,
     env: opts.env && { ...process.env, ...opts.env },
+    timeout: opts.timeoutMs,
   });
   if (opts.stdin !== undefined && child.stdin) {
     child.stdin.write(opts.stdin);
@@ -43,19 +46,20 @@ export async function captureBytes(argv: string[], opts: Options = {}): Promise<
   return out.stdout;
 }
 
-export const sleep = (ms: number) => Bun.sleep(ms);
-
-/** Calls `probe` until it returns a value, or throws after `timeoutMs`. */
+/**
+ * Calls `probe` until it returns a value, or throws after `timeoutMs`. Each
+ * call gets the time that is left, and kills its child after it.
+ */
 export async function waitFor<T>(
   what: string,
   timeoutMs: number,
-  probe: () => Promise<T | undefined>,
+  probe: (leftMs: number) => Promise<T | undefined>,
 ): Promise<T> {
   const end = Date.now() + timeoutMs;
   for (;;) {
-    const value = await probe();
+    const value = await probe(Math.max(end - Date.now(), 1000));
     if (value !== undefined) return value;
     if (Date.now() > end) throw new Error(`timed out after ${timeoutMs / 1000} s: ${what}`);
-    await sleep(1000);
+    await Bun.sleep(1000);
   }
 }

@@ -2,16 +2,18 @@
 // Development). The password goes to pippin on stdin only.
 
 import { closeSync, constants, existsSync, openSync, rmSync, writeSync } from "node:fs";
-import { capture, sleep, spawn } from "./proc";
+import { capture, spawn } from "./proc";
 import type { Login } from "./login";
 
 const ROOT = `${import.meta.dir}/..`;
-export const BINARY = `${ROOT}/target/release/pippin`;
+// An explicit target dir, so that a CARGO_TARGET_DIR cannot move the binary.
+const TARGET = `${ROOT}/target`;
+const BINARY = `${TARGET}/release/pippin`;
 export const SIZE = "1920x1080";
 
 /** Builds pippin at the lowest priority with 8 jobs: asrock is Dominic's desktop. */
 export async function build(log: string): Promise<void> {
-  const out = await spawn(["nice", "-n", "19", "cargo", "build", "--release", "--locked"], {
+  const out = await spawn(["nice", "-n", "19", "cargo", "build", "--release", "--locked", "--target-dir", TARGET], {
     cwd: ROOT,
     env: { CARGO_BUILD_JOBS: "8" },
   });
@@ -22,6 +24,15 @@ export async function build(log: string): Promise<void> {
 /** pippin binds fixed UDP ports, so only one session runs on a machine. */
 export async function running(): Promise<boolean> {
   return (await spawn(["pgrep", "-x", "pippin"])).code === 0;
+}
+
+/** The pictures that pippin decoded from `fromS` to `toS`, in Unix seconds, from --stats-json. */
+export async function decoded(out: string, fromS: number, toS: number): Promise<number> {
+  const lines = (await Bun.file(`${out}/stats.jsonl`).text()).trim().split("\n");
+  return lines
+    .map((l) => JSON.parse(l) as { t: number; decode_aus: number })
+    .filter((l) => l.t > fromS && l.t <= toS)
+    .reduce((sum, l) => sum + l.decode_aus, 0);
 }
 
 export class Session {
@@ -45,11 +56,13 @@ export class Session {
     const log = openSync(`${out}/pippin.log`, "a");
     const argv = [BINARY, "--headless", ip, "--user", login.username, "--password-stdin"];
     argv.push("--session", "share", "--size", SIZE, "-v", "--stats-json", `${out}/stats.jsonl`);
+    // PIPPIN_PASSWORD would win over stdin.
+    const { PIPPIN_PASSWORD: _, ...env } = process.env;
     const child = Bun.spawn(argv, {
       stdin: "pipe",
       stdout: log,
       stderr: log,
-      env: { ...process.env, PIPPIN_CONTROL_FIFO: fifo },
+      env: { ...env, PIPPIN_CONTROL_FIFO: fifo },
     });
     closeSync(log);
     child.stdin.write(`${login.password}\n`);
@@ -72,7 +85,7 @@ export class Session {
     const end = Date.now() + timeoutMs;
     while (Date.now() < end && this.child.exitCode === null) {
       if (existsSync(path)) return path;
-      await sleep(250);
+      await Bun.sleep(250);
     }
     return existsSync(path) ? path : undefined;
   }
@@ -80,7 +93,7 @@ export class Session {
   /** Sends `quit`, and returns the exit code of pippin. */
   async quit(): Promise<number> {
     if (this.child.exitCode === null) this.send("quit");
-    const code = await Promise.race([this.child.exited, sleep(15_000).then(() => undefined)]);
+    const code = await Promise.race([this.child.exited, Bun.sleep(15_000).then(() => undefined)]);
     this.close();
     return code ?? -1;
   }

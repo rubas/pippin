@@ -6,6 +6,7 @@ const API = "https://secrets.rubas.dev/api";
 const PROJECT = "270d0dff-f490-40fa-b44c-74c1953174e4"; // r-dotfiles
 const ENV = "dev";
 const FOLDER = "pippin-vm";
+const SCOPE = { projectId: PROJECT, environment: ENV, secretPath: `/${FOLDER}` };
 
 export type Login = { username: string; password: string };
 
@@ -30,7 +31,7 @@ async function fail(what: string, res: Response): Promise<never> {
 }
 
 async function read(key: string): Promise<string | undefined> {
-  const q = new URLSearchParams({ projectId: PROJECT, environment: ENV, secretPath: `/${FOLDER}` });
+  const q = new URLSearchParams(SCOPE);
   const res = await call("GET", `/v4/secrets/${key}?${q}`);
   if (res.status === 404) return undefined;
   if (!res.ok) return fail(`read ${key}`, res);
@@ -44,7 +45,7 @@ export async function readLogin(): Promise<Login | undefined> {
 }
 
 async function write(key: string, value: string): Promise<void> {
-  const body = { projectId: PROJECT, environment: ENV, secretPath: `/${FOLDER}`, secretValue: value, type: "shared" };
+  const body = { ...SCOPE, secretValue: value, type: "shared" };
   const created = await call("POST", `/v4/secrets/${key}`, body);
   if (created.ok) return;
   if (created.status !== 400) return fail(`create ${key}`, created);

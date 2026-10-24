@@ -4,11 +4,12 @@
 
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { capture, spawn, waitFor, type Options, type Output } from "./proc";
+import { capture, spawn, waitFor, type Options } from "./proc";
 
 export const USER = "admin";
 
-const STATE = `${homedir()}/.local/state/pippin-e2e`;
+/** Files of this tool that outlive a reboot of this machine. */
+export const STATE = `${homedir()}/.local/state/pippin-e2e`;
 // Every clone of one base has the same host key. `setup` forgets it when it
 // builds a new base.
 export const KNOWN_HOSTS = `${STATE}/known_hosts`;
@@ -45,8 +46,9 @@ export class Guest {
     return capture(this.argv(command), opts);
   }
 
-  try(command: string, opts: Options = {}): Promise<Output> {
-    return spawn(this.argv(command), opts);
+  /** Runs a shell command in the guest, and tells whether it exited with 0. */
+  async ok(command: string, timeoutMs?: number): Promise<boolean> {
+    return (await spawn(this.argv(command), { timeoutMs })).code === 0;
   }
 
   /** Writes `data` to `path` in the guest, with the given mode. */
@@ -55,13 +57,13 @@ export class Guest {
   }
 
   async waitSsh(timeoutMs: number): Promise<void> {
-    await waitFor("ssh to the VM", timeoutMs, async () => ((await this.try("true")).code === 0 ? true : undefined));
+    await waitFor("ssh to the VM", timeoutMs, async (left) => (await this.ok("true", left)) || undefined);
   }
 
   /** Waits until `admin` is logged in at the console, with the Dock and the Finder up. */
   async waitDesktop(timeoutMs: number): Promise<void> {
     const ready = `[ "$(stat -f %Su /dev/console)" = ${USER} ] && pgrep -qx Dock && pgrep -qx Finder`;
-    await waitFor("admin at the console", timeoutMs, async () => ((await this.try(ready)).code === 0 ? true : undefined));
+    await waitFor("admin at the console", timeoutMs, async (left) => (await this.ok(ready, left)) || undefined);
   }
 
   /** The time of the guest, in the format of `log show --start`. */
@@ -75,10 +77,14 @@ export class Guest {
     return this.sh(`/usr/bin/log show --style compact --info --start '${start}' --predicate '${predicate}'`);
   }
 
-  /** The screens that AppKit lists: id, size, origin, and name. */
-  async displays(): Promise<string> {
-    const script = await Bun.file(`${import.meta.dir}/guest/displays.js`).text();
-    await this.put("/tmp/pippin-e2e-displays.js", script);
-    return this.sh("osascript -l JavaScript /tmp/pippin-e2e-displays.js");
+  /** Runs a JavaScript for Automation script of e2e/guest/ with `args`. */
+  async jxa(name: string, args: string[] = [], timeoutMs?: number): Promise<string> {
+    const script = await Bun.file(`${import.meta.dir}/guest/${name}`).text();
+    return this.sh(["osascript -l JavaScript -", ...args].join(" "), { stdin: script, timeoutMs });
+  }
+
+  /** The displays of CoreGraphics and the screens of AppKit (guest/displays.js). */
+  displays(timeoutMs?: number): Promise<string> {
+    return this.jxa("displays.js", [], timeoutMs);
   }
 }

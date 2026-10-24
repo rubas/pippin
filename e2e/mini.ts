@@ -25,10 +25,30 @@ const LOCK = "~/.cache/pippin-vm.lock";
 const SLOTS_FULL = "exceeds the system limit";
 const SLOT_WAIT_MIN = 10;
 
+// `cancel` writes this file, and the start loop ends when it sees it. A
+// local kill of ssh would leave the remote loop running.
+const CANCEL = `${LOCK}/cancel`;
+
 const PRELUDE = "set -eu\nPATH=/opt/homebrew/bin:$PATH\n";
 
+// The scripts that run on the mini now, so that `cancel` can wait for them.
+const inflight = new Set<Promise<string>>();
+
 function mini(script: string): Promise<string> {
-  return capture(["ssh", "-o", "ConnectTimeout=10", "macmini", "zsh", "-l"], { stdin: PRELUDE + script });
+  const call = capture(["ssh", "-o", "ConnectTimeout=10", "macmini", "zsh", "-l"], { stdin: PRELUDE + script });
+  inflight.add(call);
+  void call.catch(() => undefined).finally(() => inflight.delete(call));
+  return call;
+}
+
+/**
+ * Ends the start loop of `owner`, and waits until every script of this
+ * process on the mini has ended. Then no VM starts after a stop.
+ */
+export async function cancel(owner: string): Promise<void> {
+  const running = [...inflight];
+  await mini(`if [ "$(cat ${LOCK}/owner 2>/dev/null)" = '${owner}' ]; then touch ${CANCEL}; fi`);
+  await Promise.allSettled(running);
 }
 
 export function readFile(path: string): Promise<Uint8Array> {
@@ -46,13 +66,9 @@ echo '${owner}' >${LOCK}/owner
 `);
 }
 
-/** Frees the lock, only when `owner` holds it. Returns false otherwise. */
-export async function unlock(owner: string): Promise<boolean> {
-  const out = await mini(`if [ "$(cat ${LOCK}/owner 2>/dev/null)" = '${owner}' ]; then
-  rm -r ${LOCK}; echo freed
-fi
-`);
-  return out.trim() === "freed";
+/** Frees the lock, only when `owner` holds it. */
+export async function unlock(owner: string): Promise<void> {
+  await mini(`if [ "$(cat ${LOCK}/owner 2>/dev/null)" = '${owner}' ]; then rm -r ${LOCK}; fi`);
 }
 
 export async function holder(): Promise<string | undefined> {
@@ -83,12 +99,14 @@ ${mac}`);
 
 /**
  * Starts `vm` headless in the launchd job. While both VM slots are busy, it
- * tries again every 30 s, for up to 10 minutes.
+ * tries again every 30 s, for up to 10 minutes, until `cancel`.
  */
 export async function start(vm: string): Promise<void> {
   await mini(`touch ${LOG}
+cancelled() { [ -e ${CANCEL} ] && echo "cancelled" >&2; }
 end=$((SECONDS + ${SLOT_WAIT_MIN * 60})) said=
 while [ $SECONDS -lt $end ]; do
+  cancelled && exit 1
   from=$(($(wc -l <${LOG}) + 1))
   launchctl submit -l ${JOB} -o ${LOG} -e ${LOG} -- /bin/zsh -lc \\
     'echo "${vm}: start $(date -u +%FT%TZ)"; tart run --no-graphics --net-bridged=en0 ${vm}; echo "${vm}: exit $? $(date -u +%FT%TZ)"; launchctl remove ${JOB}'
@@ -102,7 +120,7 @@ while [ $SECONDS -lt $end ]; do
     echo "both VM slots of the Mac are busy; waiting up to ${SLOT_WAIT_MIN} min for one" >&2
     said=1
   fi
-  sleep 25
+  for _ in $(seq 25); do cancelled && exit 1; sleep 1; done
 done
 echo "both VM slots stayed busy for ${SLOT_WAIT_MIN} min" >&2
 exit 1
@@ -114,26 +132,23 @@ export async function ip(vm: string): Promise<string> {
   return (await mini(`tart ip ${vm} --resolver arp --wait 120`)).trim();
 }
 
+// A zsh step that waits until the launchd job ends, and fails after `timeoutS`.
+const jobEnded = (timeoutS: number) => `for _ in $(seq ${timeoutS}); do launchctl list ${JOB} >/dev/null 2>&1 || break; sleep 1; done
+if launchctl list ${JOB} >/dev/null 2>&1; then
+  echo "the VM still runs after ${timeoutS} s; see ${LOG} on the mini" >&2
+  exit 1
+fi
+`;
+
 /** Waits until the launchd job ends, after the guest shut itself down. */
 export async function waitStopped(timeoutS: number): Promise<void> {
-  await mini(`for _ in $(seq ${timeoutS}); do
-  launchctl list ${JOB} >/dev/null 2>&1 || exit 0
-  sleep 1
-done
-echo "the VM still runs after ${timeoutS} s" >&2
-exit 1
-`);
+  await mini(jobEnded(timeoutS));
 }
 
 /** Stops every VM of this tool that runs, and deletes the clones. */
 export async function stopAndDelete(): Promise<void> {
   await mini(`for vm in ${RUN} ${BUILD}; do tart stop $vm --timeout 5 >/dev/null 2>&1 || true; done
-for _ in $(seq 60); do launchctl list ${JOB} >/dev/null 2>&1 || break; sleep 1; done
-if launchctl list ${JOB} >/dev/null 2>&1; then
-  echo "the VM did not stop; see ${LOG} on the mini" >&2
-  exit 1
-fi
-for vm in ${RUN} ${BUILD}; do tart delete $vm 2>/dev/null || true; done
+${jobEnded(60)}for vm in ${RUN} ${BUILD}; do tart delete $vm 2>/dev/null || true; done
 `);
 }
 

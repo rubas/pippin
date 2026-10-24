@@ -12,7 +12,7 @@ import * as mini from "./mini";
 import { capture, spawn, waitFor } from "./proc";
 
 /** The password of `admin` in the Tart image. It is public. */
-const IMAGE_PASSWORD = "admin";
+const IMAGE_PASSWORD = "admin"; // approved non-sensitive: the public default of the Cirrus Labs image, replaced by setup
 
 function randomPassword(length = 24): string {
   const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -45,8 +45,8 @@ async function installKeys(ip: string): Promise<void> {
     argv.push(`${USER}@${ip}`, script);
     const keys = await mini.authorizedKeys();
     const env = { SSH_ASKPASS: askpass, SSH_ASKPASS_REQUIRE: "force" };
-    await waitFor("the first ssh login to the VM", 120_000, async () => {
-      const out = await spawn(argv, { stdin: keys, env });
+    await waitFor("the first ssh login to the VM", 120_000, async (left) => {
+      const out = await spawn(argv, { stdin: keys, env, timeoutMs: left });
       return out.code === 0 ? true : undefined;
     });
   } finally {

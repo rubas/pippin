@@ -1,12 +1,12 @@
 // The end-to-end scenarios. Each one drives a headless pippin session against
 // a fresh clone of the test VM, and reports its checks through `ctx.check`.
 
-import { litShare, size } from "./frame";
+import { differingPixels, litShare, size } from "./frame";
 import type { Guest } from "./guest";
 import type { Login } from "./login";
 import { readFile } from "./mini";
-import { Session, SIZE } from "./pippin";
-import { sleep, waitFor } from "./proc";
+import { decoded, Session, SIZE } from "./pippin";
+import { waitFor } from "./proc";
 
 export type Context = {
   guest: Guest;
@@ -51,7 +51,7 @@ const smoke: Scenario = {
   about: "connect, take a snapshot of the desktop, and quit",
   async run(ctx) {
     await connected(ctx, ["WindowServer", "screensharingd"], async (session) => {
-      await sleep(5000);
+      await Bun.sleep(5000);
       const png = await session.snapshot("1-desktop");
       const got = png ? await size(png) : "none";
       ctx.check("frame size", got === SIZE, got);
@@ -71,8 +71,8 @@ async function startVdisplay(ctx: Context): Promise<void> {
     `launchctl submit -l dev.rubas.vdisplay -o /tmp/vdisplay.log -e /tmp/vdisplay.log -- "$HOME/vdisplay" ${VDISPLAY_ARGS}`,
   );
   ctx.onTeardown(async () => Bun.write(`${ctx.out}/vdisplay.log`, await ctx.guest.sh("cat /tmp/vdisplay.log")));
-  const screens = await waitFor("a second screen from vdisplay", 20_000, async () => {
-    const lines = (await ctx.guest.displays()).split("\n").filter((l) => l.startsWith("screen "));
+  const screens = await waitFor("a second screen from vdisplay", 20_000, async (left) => {
+    const lines = (await ctx.guest.displays(left)).split("\n").filter((l) => l.startsWith("screen "));
     return lines.length >= 2 ? lines : undefined;
   });
   ctx.check("vdisplay", true, screens.join("; "));
@@ -84,21 +84,36 @@ function fullscreen(vdisplay: boolean): Scenario {
   return {
     about: `put a ${APP} window into native fullscreen, ${vdisplay ? "with" : "without"} the mini's vdisplay`,
     async run(ctx) {
+      let window: string | undefined, full: string | undefined;
+      let windowAt = 0, fullAt = 0;
       if (vdisplay) await startVdisplay(ctx);
       await Bun.write(`${ctx.out}/displays-before.txt`, await ctx.guest.displays());
       await connected(ctx, ["WindowServer", "screensharingd", APP], async (session) => {
         await Bun.write(`${ctx.out}/displays-connected.txt`, await ctx.guest.displays());
         await ctx.guest.put("/tmp/pippin-e2e.txt", "pippin e2e: this window goes into fullscreen.\n");
         await ctx.guest.sh(`open -a ${APP} /tmp/pippin-e2e.txt`);
-        await sleep(3000);
-        ctx.check("app runs", (await ctx.guest.try(`pgrep -qx ${APP}`)).code === 0, APP);
-        await session.snapshot("1-window");
+        await Bun.sleep(3000);
+        ctx.check("app runs", await ctx.guest.ok(`pgrep -qx ${APP}`), APP);
+        window = await session.snapshot("1-window");
+        windowAt = Date.now() / 1000;
+        await Bun.write(`${ctx.out}/windows-window.txt`, await ctx.guest.jxa("windows.js", [APP]));
         session.send("key ctrl+cmd+f");
-        await sleep(10_000);
-        const png = await session.snapshot("2-fullscreen");
+        await Bun.sleep(10_000);
+        full = await session.snapshot("2-fullscreen");
+        fullAt = Date.now() / 1000;
         await Bun.write(`${ctx.out}/displays-fullscreen.txt`, await ctx.guest.displays());
-        await checkLit(ctx, "fullscreen frame", png);
+        const windows = (await ctx.guest.jxa("windows.js", [APP])).trim().split("\n");
+        ctx.check("app is in fullscreen", windows.includes(`${SIZE}+0+0`), `windows of ${APP}: ${windows.join(", ")}`);
+        await checkLit(ctx, "fullscreen frame", full);
       });
+      // A frozen stream would show an old picture: the fullscreen snapshot
+      // must differ from the window, and pippin must have decoded new
+      // pictures in between. The stats are complete once pippin quit.
+      if (window && full) {
+        const pixels = await differingPixels(window, full);
+        const pictures = await decoded(ctx.out, windowAt, fullAt);
+        ctx.check("fullscreen picture is new", pixels > 0 && pictures > 0, `${pixels} pixels differ, ${pictures} pictures decoded`);
+      }
       // WindowServer also logs "Invalid display" for the new display of each
       // Screen Sharing session, before the display exists. Only the app's
       // lines show the bug.
