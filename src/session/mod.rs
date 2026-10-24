@@ -91,6 +91,8 @@ pub struct Config {
     pub control_fifo: Option<PathBuf>,
     /// Plays the Mac's sound; `None` asks the host not to send any.
     pub audio: Option<crate::audio::Player>,
+    /// Mirror the local clipboard and the host pasteboard.
+    pub clipboard: bool,
 }
 
 pub type AuthHook = Arc<dyn Fn(bool) + Send + Sync>;
@@ -633,9 +635,12 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
         let offer = neg.offer.clone();
         spawn(threads, "feedback", move || media::feedback(shared, sockets, offer, fb_rx, dec_tx));
     }
-    {
-        let (shared, control) = (shared.clone(), control.clone());
-        spawn(threads, "clipboard", move || crate::clipboard::run(shared, control, clip_rx));
+    if cfg.clipboard {
+        let (s, c) = (shared.clone(), control.clone());
+        spawn(threads, "clipboard", move || crate::clipboard::run(s, c, clip_rx));
+        // Subscribe to pasteboard changes and prime with the current contents.
+        control.send(&crate::proto::clipboard::enable_auto_pasteboard());
+        control.send(&crate::proto::clipboard::request_pasteboard());
     }
     if let Some(path) = cfg.control_fifo.clone() {
         let (shared, control, fb) = (shared.clone(), control.clone(), fb_tx.clone());
@@ -646,9 +651,6 @@ fn run(cfg: Config, display: DisplayRequest, shared: Arc<Shared>, threads: &Mute
         spawn(threads, "stats-json", move || metrics::writer(shared, path));
     }
 
-    // Subscribe to pasteboard changes and prime with the current contents.
-    control.send(&crate::proto::clipboard::enable_auto_pasteboard());
-    control.send(&crate::proto::clipboard::request_pasteboard());
     shared.sink.emit(Event::Connected);
     {
         let (shared, host, answered, resumed) = (shared.clone(), cfg.host, neg.canvas.is_some(), cfg.resumed);
