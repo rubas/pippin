@@ -9,7 +9,7 @@ Normally reserved for Mac-to-Mac connections, Apple's high-performance mode deli
 * **Dynamic Display:** Automatically resizes the Mac's resolution to fit your Linux window.
 * **Zero-Lag Cursor:** Renders the cursor locally so mouse movement always feels instant.
 * **GPU-Accelerated:** Uses hardware decoding via CUDA or VAAPI whenever supported.
-* **Two-Way Clipboard:** Copy and paste text and images seamlessly between Linux and macOS.
+* **Two-Way Clipboard:** Copy and paste text and images between Linux and macOS, in one or both directions, when you turn it on with `--clipboard`.
 
 ## Requirements
 
@@ -91,6 +91,7 @@ When prompted interactively, `pippin` offers to save your password to the deskto
 | `--decoder <TYPE>` | Choose video decoder: `auto` (default), `cuda`, `vaapi`, or `software`. Use `--vaapi-device` to specify a render node. |
 | `--after-loss idr\|conceal` | On packet loss, freeze until the next keyframe (`idr`, default) or continue with visual artifacts (`conceal`). |
 | `--no-audio` | Mute audio and instruct the Mac not to stream sound. |
+| `--clipboard off\|receive\|send\|both` | Share the clipboard: `receive` copies from the Mac to Linux, `send` from Linux to the Mac, and `both` both ways. Defaults to `off`. |
 | `--swap-ctrl-cmd` | Map `Ctrl` to `⌘`. By default, `Super` is `⌘` and `Alt` is `⌥`. |
 | `-v`, `-vv` | Enable debug or trace logging (passwords and clipboard contents are never logged). |
 

@@ -13,7 +13,8 @@
 //!   the [`audio::Player`](crate::audio::Player) and records sender reports.
 //! * `feedback` sends RTCP (receiver reports, keyframe requests, NACKs, LTR
 //!   acks), the audio keepalive and the cursor poll on a 500 ms tick.
-//! * `clipboard` mirrors text between the local and remote pasteboards.
+//! * `clipboard` shares text and images with the host pasteboard, in the
+//!   directions that `--clipboard` allows.
 //! * `control-fifo` (debug, `PIPPIN_CONTROL_FIFO`) switches the operating
 //!   point mid-session, sends input and asks for snapshots; `stats-json`
 //!   (`--stats-json`) writes metrics.
@@ -94,8 +95,8 @@ pub struct Config {
     pub control_fifo: Option<PathBuf>,
     /// Plays the Mac's sound; `None` asks the host not to send any.
     pub audio: Option<crate::audio::Player>,
-    /// Mirror the local clipboard and the host pasteboard.
-    pub clipboard: bool,
+    /// Which way the local clipboard and the host pasteboard are shared.
+    pub clipboard: crate::clipboard::Mode,
 }
 
 pub type AuthHook = Arc<dyn Fn(bool) + Send + Sync>;
@@ -199,14 +200,23 @@ impl Control {
         Ok(Arc::new(Control { queue: Mutex::new(Some(tx)), video_ssrc: offer.video_ssrc, offer: Mutex::new(offer) }))
     }
 
-    fn queue(&self, item: Outgoing) {
-        if let Some(q) = &*self.queue.lock() {
-            let _ = q.send(item);
-        }
+    /// Fails with `NotConnected` once the session closed the queue or the
+    /// writer stopped on a dead connection.
+    fn queue(&self, item: Outgoing) -> std::io::Result<()> {
+        let queued = self.queue.lock().as_ref().is_some_and(|q| q.send(item).is_ok());
+        if queued { Ok(()) } else { Err(std::io::ErrorKind::NotConnected.into()) }
     }
 
+    /// Queues one message. The writer writes all records of a large message
+    /// in one write, so no other message lands between them.
+    pub fn try_send(&self, msg: &[u8]) -> std::io::Result<()> {
+        self.queue(Outgoing::Message(msg.to_vec()))
+    }
+
+    /// Queues one message. A failure means the connection is gone, which the
+    /// control reader reports.
     pub fn send(&self, msg: &[u8]) {
-        self.queue(Outgoing::Message(msg.to_vec()));
+        let _ = self.try_send(msg);
     }
 
     pub fn key(&self, down: bool, keysym: u32) {
@@ -215,14 +225,14 @@ impl Control {
 
     /// Pointer position in canvas pixels plus the RFB button mask.
     pub fn pointer(&self, buttons: u8, x: u16, y: u16) {
-        self.queue(Outgoing::Pointer(Pointer { buttons, x, y }));
+        let _ = self.queue(Outgoing::Pointer(Pointer { buttons, x, y }));
     }
 
     /// Scrolls whole wheel steps at a pointer position in canvas pixels:
     /// `steps.0` positive scrolls right, `steps.1` positive scrolls down.
     pub fn scroll(&self, buttons: u8, x: u16, y: u16, steps: (i32, i32)) {
         for p in writer::scroll(Pointer { buttons, x, y }, steps) {
-            self.queue(Outgoing::Pointer(p));
+            let _ = self.queue(Outgoing::Pointer(p));
         }
     }
 
@@ -705,9 +715,12 @@ fn run(cfg: Config, display: Option<DisplayRequest>, shared: Arc<Shared>, thread
         let offer = neg.offer.clone();
         spawn(threads, "feedback", move || media::feedback(shared, sockets, offer, fb_rx, dec_tx));
     }
-    if cfg.clipboard {
+    let clipboard = cfg.clipboard;
+    if clipboard != crate::clipboard::Mode::Off {
         let (s, c) = (shared.clone(), control.clone());
-        spawn(threads, "clipboard", move || crate::clipboard::run(s, c, clip_rx));
+        spawn(threads, "clipboard", move || crate::clipboard::run(s, c, clip_rx, clipboard));
+    }
+    if clipboard.receives() {
         // Subscribe to pasteboard changes and prime with the current contents.
         control.send(&crate::proto::clipboard::enable_auto_pasteboard());
         control.send(&crate::proto::clipboard::request_pasteboard());
@@ -814,6 +827,27 @@ pub(super) mod tests {
         assert_eq!(host.next(), Some(messages::key_event(true, 0x61)));
         assert_eq!(host.next(), Some(messages::key_event(false, 0x61)));
         assert_eq!(host.next(), None);
+    }
+
+    #[test]
+    fn a_100_kb_message_between_two_keys_reaches_the_mac_in_two_records_in_order() {
+        let (_shared, control, mut host, _events) = connected(None);
+        let big: Vec<u8> = (0..100_000u32).map(|i| i as u8).collect();
+        control.key(true, 0x61);
+        control.try_send(&big).unwrap();
+        control.key(false, 0x61);
+        assert_eq!(host.next(), Some(messages::key_event(true, 0x61)));
+        let (head, tail) = big.split_at(65_498);
+        assert_eq!(host.next().as_deref(), Some(head));
+        assert_eq!(host.next().as_deref(), Some(tail));
+        assert_eq!(host.next(), Some(messages::key_event(false, 0x61)));
+    }
+
+    #[test]
+    fn try_send_after_close_fails() {
+        let (_shared, control, _host, _events) = connected(None);
+        control.close();
+        assert_eq!(control.try_send(b"clip").unwrap_err().kind(), std::io::ErrorKind::NotConnected);
     }
 
     /// A local TCP connection: pippin's end, and the Mac's end that reads it.

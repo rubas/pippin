@@ -116,6 +116,11 @@ struct Cli {
     /// pippin's virtual display, so pippin refuses them with this flag.
     #[arg(long, conflicts_with_all = ["scale", "max_resolution", "render_scale"])]
     no_virtual_display: bool,
+    /// Share the clipboard with the Mac: receive copies what you copy on the
+    /// Mac to this machine, send copies what you copy here to the Mac, and
+    /// both does both. Not with --headless.
+    #[arg(long, value_enum, default_value_t = clipboard::Mode::Off, conflicts_with = "headless")]
+    clipboard: clipboard::Mode,
     /// Send Ctrl as Command and Super as Control.
     #[arg(long)]
     swap_ctrl_cmd: bool,
@@ -432,8 +437,7 @@ fn connect(
         // lines such as `fps 30` or `hold off` to this FIFO, or send input.
         control_fifo: std::env::var_os("PIPPIN_CONTROL_FIFO").map(PathBuf::from),
         audio: audio.clone(),
-        // The local clipboard belongs to whoever sits at this machine.
-        clipboard: !cli.headless,
+        clipboard: cli.clipboard,
     };
     let event_loop = match viewer {
         Viewer::Window(event_loop) => event_loop,
