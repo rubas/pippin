@@ -4,11 +4,13 @@
 
 import { closeSync, constants, existsSync, mkdirSync, openSync, rmSync, writeSync } from "node:fs";
 import { userInfo } from "node:os";
+import { dirname } from "node:path";
 import { dockerRun } from "./container";
 import { capture, spawn } from "./proc";
 import type { Login } from "./login";
 
-const ROOT = `${import.meta.dir}/..`;
+// A clean path: the container has the binary, but no e2e directory to walk up from.
+const ROOT = dirname(import.meta.dir);
 // An explicit target dir, so that a CARGO_TARGET_DIR cannot move the binary.
 const TARGET = `${ROOT}/target`;
 const BINARY = `${TARGET}/release/pippin`;
