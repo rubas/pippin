@@ -103,10 +103,6 @@ mod tests {
     const RED_RGB: [u8; 3] = [254, 0, 0];
     const BLUE_RGB: [u8; 3] = [0, 0, 254];
 
-    fn full() -> Conversion {
-        Colour::default().conversion()
-    }
-
     fn plane(data: &[u8], stride: u32, width: u32, height: u32) -> PlaneRef<'_> {
         PlaneRef { data, stride, width, height }
     }
@@ -123,7 +119,7 @@ mod tests {
         for (i, c) in [RED, BLUE].into_iter().enumerate() {
             let [y, u, v] = tile(c);
             let planes = [plane(&y, 6, 4, 2), plane(&u, 3, 2, 1), plane(&v, 3, 2, 1)];
-            draw_tile(&mut img, i as u32 * 2, Layout::Planar, &full(), &planes);
+            draw_tile(&mut img, i as u32 * 2, Layout::Planar, &Colour::default().conversion(), &planes);
         }
         let path = std::env::temp_dir().join(format!("pippin-snapshot-test-{}.png", std::process::id()));
         write_png(&img, &path).unwrap();
@@ -180,11 +176,11 @@ mod tests {
         // NV12: one 2×2 tile, the chroma plane holds U then V.
         let (y, uv) = ([RED[0]; 4], [RED[1], RED[2]]);
         let mut img = RgbImage::new(2, 2);
-        draw_tile(&mut img, 0, Layout::SemiPlanar, &full(), &[plane(&y, 2, 2, 2), plane(&uv, 2, 1, 1)]);
+        draw_tile(&mut img, 0, Layout::SemiPlanar, &Colour::default().conversion(), &[plane(&y, 2, 2, 2), plane(&uv, 2, 1, 1)]);
         assert!(img.pixels().all(|p| p.0 == RED_RGB));
         // VUYX: one plane of V, U, Y, X bytes.
         let vuyx = [BLUE[2], BLUE[1], BLUE[0], 0xff].repeat(4);
-        draw_tile(&mut img, 0, Layout::Vuyx, &full(), &[plane(&vuyx, 8, 2, 2)]);
+        draw_tile(&mut img, 0, Layout::Vuyx, &Colour::default().conversion(), &[plane(&vuyx, 8, 2, 2)]);
         assert!(img.pixels().all(|p| p.0 == BLUE_RGB));
     }
 }
