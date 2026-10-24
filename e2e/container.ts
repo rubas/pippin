@@ -62,21 +62,15 @@ export async function prepare(peer: string): Promise<void> {
   if (!dev || !existsSync(`/sys/class/net/${dev}/device`) || existsSync(`/sys/class/net/${dev}/wireless`)) {
     throw new Error(`e2e needs a wired LAN to ${peer}, and the route is: ${route.trim()}`);
   }
-  const docker = (args: string[]) =>
-    spawn(["docker", ...args]).catch(() => {
-      throw new Error("e2e runs pippin in Docker, and docker is missing");
-    });
-  const parent = await docker(["network", "inspect", "--format", "{{.Options.parent}}", NETWORK]);
+  const parent = await spawn(["docker", "network", "inspect", "--format", "{{.Options.parent}}", NETWORK]);
   if (parent.code === 0) {
     const was = new TextDecoder().decode(parent.stdout).trim();
     if (was !== dev) throw new Error(`the Docker network ${NETWORK} is on ${was}, not ${dev}; remove it`);
   } else {
     const net = ["--driver", "macvlan", "--subnet", SUBNET, "--gateway", GATEWAY, "--ip-range", `${IP}/32`];
-    const out = await docker(["network", "create", ...net, "--opt", `parent=${dev}`, NETWORK]);
-    if (out.code !== 0) throw new Error(`cannot create the Docker network ${NETWORK}: ${out.stderr.trim()}`);
+    await capture(["docker", "network", "create", ...net, "--opt", `parent=${dev}`, NETWORK]);
   }
-  if ((await docker(["image", "inspect", IMAGE])).code !== 0) {
-    const out = await docker(["pull", "--quiet", IMAGE]);
-    if (out.code !== 0) throw new Error(`cannot pull ${IMAGE}: ${out.stderr.trim()}`);
+  if ((await spawn(["docker", "image", "inspect", IMAGE])).code !== 0) {
+    await capture(["docker", "pull", "--quiet", IMAGE]);
   }
 }
