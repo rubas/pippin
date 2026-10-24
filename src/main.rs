@@ -80,8 +80,9 @@ struct Cli {
     scale: Option<f64>,
     /// Largest virtual display to ask the Mac for, in pixels, e.g.
     /// 5120x2880. Defaults to the size of the largest monitor. It holds for
-    /// the whole session. The Mac can still choose a smaller one.
-    #[arg(long, value_parser = parse_size)]
+    /// the whole session. The Mac can still choose a smaller one. Not with
+    /// --headless, where --size sets the exact display.
+    #[arg(long, value_parser = parse_size, conflicts_with = "headless")]
     max_resolution: Option<(u32, u32)>,
     /// Fraction of the window's pixels the Mac renders and streams; the
     /// picture is scaled up locally. 0.5 on a Retina screen streams a quarter
@@ -486,6 +487,12 @@ mod tests {
             let e = parse(&[&["--no-virtual-display"], args].concat()).err();
             assert!(e.is_some(), "{args:?} was accepted");
         }
+    }
+
+    #[test]
+    fn headless_refuses_max_resolution_because_size_sets_the_display() {
+        assert!(parse(&["--headless", "--max-resolution", "5120x2880"]).is_err());
+        assert!(parse(&["--max-resolution", "5120x2880"]).is_ok());
     }
 
     #[test]
