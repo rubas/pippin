@@ -32,3 +32,16 @@ jobs:
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets
         if: matrix.toolchain == 'stable'
+
+  e2e:
+    name: e2e (types and tests)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: e2e
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - run: bun test
