@@ -175,8 +175,6 @@ impl FrameStore {
 pub struct Control {
     /// `None` once the session closed it.
     queue: Mutex<Option<Sender<Outgoing>>>,
-    /// The socket of the writer, to reset at shutdown.
-    socket: TcpStream,
     /// Our video SSRC, the one our SRs are sent as.
     video_ssrc: u32,
     /// The media offer, re-sent after a resize and changed by the
@@ -185,7 +183,9 @@ pub struct Control {
 }
 
 impl Control {
-    /// Starts the writer thread for `stream`.
+    /// Starts the writer thread for `stream`. A write blocks until TCP
+    /// gives up on the connection (`CONTROL_ACK_TIMEOUT`), so a write that
+    /// stalls for a while does not end the writer while the session lives on.
     fn start(
         stream: TcpStream,
         sealer: RecordSealer,
@@ -193,10 +193,10 @@ impl Control {
         offer: MediaOffer,
         threads: &Mutex<Vec<JoinHandle<()>>>,
     ) -> std::io::Result<Arc<Self>> {
-        let socket = stream.try_clone()?;
+        stream.set_write_timeout(None)?;
         let (tx, rx) = crossbeam_channel::unbounded();
         spawn(threads, "control-tx", move || writer::run(rx, stream, sealer, record_key));
-        Ok(Arc::new(Control { queue: Mutex::new(Some(tx)), socket, video_ssrc: offer.video_ssrc, offer: Mutex::new(offer) }))
+        Ok(Arc::new(Control { queue: Mutex::new(Some(tx)), video_ssrc: offer.video_ssrc, offer: Mutex::new(offer) }))
     }
 
     fn queue(&self, item: Outgoing) {
@@ -226,13 +226,10 @@ impl Control {
         }
     }
 
-    /// Ends the writer and resets the connection, so the host tears the
-    /// session down at once instead of waiting out its own timeouts.
+    /// Closes the queue: the writer sends what is in it, and then resets the
+    /// connection.
     fn close(&self) {
-        if self.queue.lock().take().is_some() {
-            let _ = socket2::SockRef::from(&self.socket).set_linger(Some(Duration::ZERO));
-            let _ = self.socket.shutdown(std::net::Shutdown::Both);
-        }
+        self.queue.lock().take();
     }
 
     pub fn reoffer(&self) {
@@ -806,6 +803,17 @@ pub(super) mod tests {
         let control = Control::start(client, RecordSealer::new(&KEYS), KEYS.key, offer, &Mutex::new(Vec::new())).unwrap();
         let _ = shared.control.set(control.clone());
         (shared, control, host, events)
+    }
+
+    #[test]
+    fn keys_queued_before_close_reach_the_mac_before_the_reset() {
+        let (_shared, control, mut host, _events) = connected(None);
+        control.key(true, 0x61);
+        control.key(false, 0x61);
+        control.close();
+        assert_eq!(host.next(), Some(messages::key_event(true, 0x61)));
+        assert_eq!(host.next(), Some(messages::key_event(false, 0x61)));
+        assert_eq!(host.next(), None);
     }
 
     /// A local TCP connection: pippin's end, and the Mac's end that reads it.

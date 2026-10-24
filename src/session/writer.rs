@@ -8,6 +8,7 @@
 
 use std::io::Write;
 use std::net::TcpStream;
+use std::time::Duration;
 
 use crossbeam_channel::Receiver;
 
@@ -65,8 +66,11 @@ fn merge(queued: impl IntoIterator<Item = Outgoing>, buttons: &mut u8) -> Vec<Ou
     out
 }
 
-/// Writes what the queue brings until the session closes the queue or the
-/// socket fails. The reader notices a dead connection and ends the session.
+/// Writes what the queue brings until the socket fails or the session
+/// closes the queue. A write fails only on a dead connection, which the
+/// reader also sees, so it ends the session. Once the queue is closed and
+/// empty, this resets the connection, so the host tears the session down at
+/// once instead of waiting out its own timeouts.
 pub(super) fn run(queue: Receiver<Outgoing>, mut stream: TcpStream, mut sealer: RecordSealer, record_key: [u8; 16]) {
     let mut buttons = 0;
     let mut bytes = Vec::new();
@@ -84,6 +88,8 @@ pub(super) fn run(queue: Receiver<Outgoing>, mut stream: TcpStream, mut sealer: 
             return;
         }
     }
+    let _ = socket2::SockRef::from(&stream).set_linger(Some(Duration::ZERO));
+    let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
 #[cfg(test)]
