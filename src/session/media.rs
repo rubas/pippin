@@ -1223,8 +1223,76 @@ const AUDIO_PT: u8 = 101;
 /// pointless (and ignored) then.
 const IDLE_AFTER_MS: u64 = 1500;
 const STALL_KEYFRAME_MS: u64 = 3000;
-const STALL_KEYFRAME_EVERY: Duration = Duration::from_millis(1500);
+const STALL_KEYFRAME_EVERY_MS: u64 = 1500;
 const STALL_RESET_MS: u64 = 8000;
+
+/// One adopted tile as the stall watch sees it: its SSRC, and the session
+/// clock (ms) of its latest packet and its latest picture, 0 for none yet.
+#[derive(Clone, Copy)]
+struct TileProgress {
+    ssrc: u32,
+    packet_ms: u64,
+    picture_ms: u64,
+}
+
+/// What the stall watch asks for on one tick.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StallRecovery {
+    /// Tiles that get a keyframe request.
+    keyframes: Vec<usize>,
+    /// Restart the decoder: a stall outlasted the keyframe requests.
+    reset: bool,
+}
+
+/// Finds tiles whose packets arrive but whose pictures do not come out:
+/// the decoder waits for a keyframe that was lost, or is wedged. It watches
+/// each tile on its own, so the pictures of the other tiles cannot hide a
+/// stalled one.
+#[derive(Default)]
+struct StallWatch {
+    /// Per SSRC with packets flowing, or with last packets that brought no
+    /// picture: when the watch first saw it flow. A tile that wakes from a
+    /// still screen has an old picture, so its stall counts from here, not
+    /// from that picture.
+    flowing_since: HashMap<u32, u64>,
+    last_keyframe_ms: Option<u64>,
+    /// A decoder reset covers every stall that began before it.
+    last_reset_ms: Option<u64>,
+}
+
+impl StallWatch {
+    fn check(&mut self, now_ms: u64, tiles: &[TileProgress]) -> StallRecovery {
+        let mut flowing_since = HashMap::new();
+        let mut r = StallRecovery::default();
+        let mut stalled = Vec::new();
+        for (tile, t) in tiles.iter().enumerate() {
+            let flowing = t.packet_ms != 0 && now_ms.saturating_sub(t.packet_ms) < IDLE_AFTER_MS;
+            // A tile that goes quiet after packets without a picture stays
+            // stalled, so a slow trickle of packets cannot restart its count.
+            let since = match self.flowing_since.get(&t.ssrc) {
+                Some(&since) if flowing || t.picture_ms < t.packet_ms => since,
+                None if flowing => now_ms,
+                _ => continue,
+            };
+            flowing_since.insert(t.ssrc, since);
+            let start = since.max(t.picture_ms);
+            let stall = now_ms.saturating_sub(start);
+            if flowing && stall >= STALL_KEYFRAME_MS {
+                stalled.push(tile);
+                r.reset |= stall > STALL_RESET_MS && self.last_reset_ms.is_none_or(|reset| start > reset);
+            }
+        }
+        self.flowing_since = flowing_since;
+        if r.reset {
+            self.last_reset_ms = Some(now_ms);
+        }
+        if !stalled.is_empty() && self.last_keyframe_ms.is_none_or(|t| now_ms.saturating_sub(t) >= STALL_KEYFRAME_EVERY_MS) {
+            self.last_keyframe_ms = Some(now_ms);
+            r.keyframes = stalled;
+        }
+        r
+    }
+}
 
 /// Per-tile packet loss and jitter, logged every STATS_EVERY at debug level
 /// so `-v` shows link quality.
@@ -1271,8 +1339,7 @@ struct FeedbackSender {
     fir_seq: u8,
     last_keyframe: HashMap<usize, Instant>,
     last_ltr: Option<u16>,
-    last_stall_keyframe: Option<Instant>,
-    stall_reset_done: bool,
+    stall: StallWatch,
     link: LinkStats,
 }
 
@@ -1377,24 +1444,32 @@ impl FeedbackSender {
         }
     }
 
-    /// Packets arriving but no pictures coming out means the decoder is
-    /// stuck waiting for a keyframe that was lost, or wedged.
+    /// Packets arriving for a tile but no pictures coming out means the
+    /// decoder is stuck waiting for a keyframe that was lost, or wedged.
     fn check_stall(&mut self, dec: &Sender<DecoderMsg>) {
-        let flowing = self.shared.since_ms(&self.shared.last_video_packet) < IDLE_AFTER_MS;
-        let stalled = self.shared.since_ms(&self.shared.last_frame);
-        if !flowing || stalled < STALL_KEYFRAME_MS || self.shared.tile_ssrcs.lock().is_empty() {
-            self.stall_reset_done = false;
-            return;
+        let tiles: Vec<TileProgress> = self
+            .shared
+            .tile_ssrcs
+            .lock()
+            .iter()
+            .enumerate()
+            .map(|(tile, &ssrc)| {
+                let (packet_ms, picture_ms) = self.shared.metrics.tile_progress(tile);
+                TileProgress { ssrc, packet_ms, picture_ms }
+            })
+            .collect();
+        let r = self.stall.check(self.shared.clock.now_ms(), &tiles);
+        if !r.keyframes.is_empty() {
+            tracing::debug!(tiles = ?r.keyframes, "no picture on tiles; requesting keyframes");
         }
-        if self.last_stall_keyframe.is_none_or(|t| t.elapsed() >= STALL_KEYFRAME_EVERY) {
-            tracing::debug!("no picture for {stalled} ms; requesting keyframes");
-            self.last_stall_keyframe = Some(Instant::now());
-            self.keyframe(None, KeyframeCause::Stall);
+        for tile in r.keyframes {
+            self.keyframe(Some(tile), KeyframeCause::Stall);
         }
-        if stalled > STALL_RESET_MS && !self.stall_reset_done {
-            tracing::warn!("video stalled for {} s; resetting decoder", stalled / 1000);
-            self.stall_reset_done = true;
+        if r.reset {
+            tracing::warn!("video stalled for over {} s; resetting decoder", STALL_RESET_MS / 1000);
             let _ = dec.send(DecoderMsg::Reset(ResetWhy::Stall));
+            // The reset drops the references of every tile.
+            self.keyframe(None, KeyframeCause::Stall);
         }
     }
 }
@@ -1415,8 +1490,7 @@ pub(super) fn feedback(
         fir_seq: 0,
         last_keyframe: HashMap::new(),
         last_ltr: None,
-        last_stall_keyframe: None,
-        stall_reset_done: false,
+        stall: StallWatch::default(),
         link: LinkStats::new(),
     };
     let mut next_tick = Instant::now();
@@ -1712,5 +1786,100 @@ mod tests {
         // The decoder sees it as lost (and then waits for a keyframe, or
         // conceals with the slice that arrived).
         assert_eq!(got, [(1, true, 1), (1, false, 1)]);
+    }
+
+    /// Four tiles with SSRCs 10 to 13, each with a packet 100 ms before
+    /// `now_ms` and its latest picture at `pictures`.
+    fn flowing(now_ms: u64, pictures: [u64; 4]) -> Vec<TileProgress> {
+        (0..4).map(|t| TileProgress { ssrc: 10 + t as u32, packet_ms: now_ms - 100, picture_ms: pictures[t] }).collect()
+    }
+
+    fn keyframes(tiles: &[usize]) -> StallRecovery {
+        StallRecovery { keyframes: tiles.to_vec(), reset: false }
+    }
+
+    #[test]
+    fn one_stalled_tile_among_flowing_tiles_gets_a_keyframe() {
+        let mut w = StallWatch::default();
+        // Tile 2 shows its last picture at 5 s; the others keep going.
+        assert_eq!(w.check(6_000, &flowing(6_000, [5_900, 5_900, 5_000, 5_900])), keyframes(&[]));
+        assert_eq!(w.check(8_500, &flowing(8_500, [8_400, 8_400, 5_000, 8_400])), keyframes(&[]));
+        assert_eq!(w.check(9_000, &flowing(9_000, [8_900, 8_900, 5_000, 8_900])), keyframes(&[2]));
+        // Requests repeat every 1.5 s while the tile stays stalled.
+        assert_eq!(w.check(9_500, &flowing(9_500, [9_400, 9_400, 5_000, 9_400])), keyframes(&[]));
+        assert_eq!(w.check(10_500, &flowing(10_500, [10_400, 10_400, 5_000, 10_400])), keyframes(&[2]));
+        // Its keyframe arrived.
+        assert_eq!(w.check(12_000, &flowing(12_000, [11_900, 11_900, 11_000, 11_900])), keyframes(&[]));
+    }
+
+    #[test]
+    fn tile_waking_from_a_still_screen_is_not_stalled() {
+        let mut w = StallWatch::default();
+        // Tile 1 was quiet for a minute; its first packet is in, its picture
+        // not yet.
+        let mut tiles = flowing(70_000, [69_900, 10_000, 69_900, 69_900]);
+        assert_eq!(w.check(70_000, &tiles), keyframes(&[]));
+        tiles[1].picture_ms = 70_100;
+        tiles.iter_mut().for_each(|t| t.packet_ms = 70_400);
+        assert_eq!(w.check(70_500, &tiles), keyframes(&[]));
+    }
+
+    #[test]
+    fn quiet_tile_is_not_stalled() {
+        let mut w = StallWatch::default();
+        let mut tiles = flowing(1_000, [900; 4]);
+        assert_eq!(w.check(1_000, &tiles), keyframes(&[]));
+        // Tile 3 shows a still part of the screen and sends nothing.
+        tiles = flowing(60_000, [59_900; 4]);
+        tiles[3] = TileProgress { ssrc: 13, packet_ms: 900, picture_ms: 900 };
+        assert_eq!(w.check(60_000, &tiles), keyframes(&[]));
+    }
+
+    #[test]
+    fn stall_that_outlasts_its_keyframes_resets_the_decoder_once() {
+        let mut w = StallWatch::default();
+        let stalled_tile_0 = |now| flowing(now, [1_000, now - 100, now - 100, now - 100]);
+        let resets: Vec<u64> = (2..=24).map(|i| i * 500).filter(|&now| w.check(now, &stalled_tile_0(now)).reset).collect();
+        // Watched from 1 s: the reset comes once the stall passes 8 s.
+        assert_eq!(resets, [9_500]);
+        // A picture ends the stall; a new one may reset again.
+        assert_eq!(w.check(12_500, &flowing(12_500, [12_400; 4])), keyframes(&[]));
+        let again: Vec<u64> = (26..=60).map(|i| i * 500).filter(|&now| w.check(now, &flowing(now, [12_400, now, now, now])).reset).collect();
+        assert_eq!(again, [20_500]);
+    }
+
+    #[test]
+    fn tile_with_a_picture_every_two_seconds_still_gets_its_lost_keyframe() {
+        let mut w = StallWatch::default();
+        // The decoder lost the keyframe after the picture at 900 ms. The
+        // host then sends one changed picture every 2 s, from 1 s on.
+        let tile = |now: u64| [TileProgress { ssrc: 10, packet_ms: now - (now - 1_000) % 2_000, picture_ms: 900 }];
+        let (mut keyframe_at, mut reset_at) = (Vec::new(), Vec::new());
+        for now in (2..=20).map(|i| i * 500) {
+            let r = w.check(now, &tile(now));
+            if !r.keyframes.is_empty() {
+                keyframe_at.push(now);
+            }
+            if r.reset {
+                reset_at.push(now);
+            }
+        }
+        // Requests go out only while its packets flow.
+        assert_eq!(keyframe_at, [4_000, 5_500, 7_000, 9_000]);
+        assert_eq!(reset_at, [9_500]);
+    }
+
+    #[test]
+    fn stall_that_begins_after_a_reset_gets_its_own_reset() {
+        let mut w = StallWatch::default();
+        // Tile 0 stalls from 1 s to 14 s. Tile 1 stalls from 10 s on, while
+        // tile 0 is still stalled.
+        let pictures = |now: u64| {
+            let tile_0 = if now < 14_000 { 1_000 } else { now - 100 };
+            let tile_1 = if now < 10_000 { now - 100 } else { 10_000 };
+            [tile_0, tile_1, now - 100, now - 100]
+        };
+        let resets: Vec<u64> = (2..=44).map(|i| i * 500).filter(|&now| w.check(now, &flowing(now, pictures(now))).reset).collect();
+        assert_eq!(resets, [9_500, 18_500]);
     }
 }

@@ -9,7 +9,7 @@ Normally reserved for Mac-to-Mac connections, Apple's high-performance mode deli
 * **Dynamic Display:** Automatically resizes the Mac's resolution to fit your Linux window.
 * **Zero-Lag Cursor:** Renders the cursor locally so mouse movement always feels instant.
 * **GPU-Accelerated:** Uses hardware decoding via CUDA or VAAPI whenever supported.
-* **Two-Way Clipboard:** Copy and paste text and images seamlessly between Linux and macOS.
+* **Two-Way Clipboard:** Copy and paste text and images between Linux and macOS, in one or both directions, when you turn it on with `--clipboard`.
 
 ## Requirements
 
@@ -91,6 +91,7 @@ When prompted interactively, `pippin` offers to save your password to the deskto
 | `--decoder <TYPE>` | Choose video decoder: `auto` (default), `cuda`, `vaapi`, or `software`. Use `--vaapi-device` to specify a render node. |
 | `--after-loss idr\|conceal` | On packet loss, freeze until the next keyframe (`idr`, default) or continue with visual artifacts (`conceal`). |
 | `--no-audio` | Mute audio and instruct the Mac not to stream sound. |
+| `--clipboard off\|receive\|send\|both` | Share the clipboard: `receive` copies from the Mac to Linux, `send` from Linux to the Mac, and `both` both ways. Defaults to `off`. |
 | `--swap-ctrl-cmd` | Map `Ctrl` to `⌘`. By default, `Super` is `⌘` and `Alt` is `⌥`. |
 | `-v`, `-vv` | Enable debug or trace logging (passwords and clipboard contents are never logged). |
 
@@ -141,7 +142,7 @@ cargo test
 * **Wire Format Tests:** `src/interop_tests.rs` verifies the protocol byte-for-byte against reference test vectors.
 * **Decoder Tests:** Marked `--ignored` by default as they require sample HEVC streams in `PIPPIN_TEST_HEVC_DIR`. You can generate these using FFmpeg (`testsrc2` + `libx265`); see `src/video/decoder.rs` for expected filenames.
 * **Network Telemetry:** Pass `--stats-json FILE` to log per-second metrics (schema in `src/session/metrics.rs`).
-* **Live Control:** Set `PIPPIN_CONTROL_FIFO=/tmp/pippin.ctl` to adjust parameters on the fly (e.g., `echo 'render_scale 0.5' > /tmp/pippin.ctl`). Supported commands (`render_scale`, `after_loss`, `hold`, `recovery`, `ltr`, `fps`, `keyframe`, `restart`, and the input and snapshot commands below) are documented in `src/session/operating.rs`.
+* **Live Control:** Set `PIPPIN_CONTROL_FIFO=$XDG_RUNTIME_DIR/pippin.ctl` to adjust parameters on the fly (e.g., `echo 'render_scale 0.5' > $XDG_RUNTIME_DIR/pippin.ctl`). pippin opens only a FIFO, not a symlink, that belongs to you and has no group or other permissions, in a directory with the same rule, such as `$XDG_RUNTIME_DIR`, and it creates a missing FIFO with mode `600`. Supported commands (`render_scale`, `after_loss`, `hold`, `recovery`, `ltr`, `fps`, `keyframe`, `restart`, and the input and snapshot commands below) are documented in `src/session/operating.rs`.
 * **Headless Runs:** `pippin --headless HOST --user USER --password-stdin --size 2560x1440` connects and decodes the video, but opens no window and needs no display server. `--size` is the Mac display in points, and `--scale` defaults to 1. A headless run never touches the local clipboard, plays no sound, and does not reconnect. It exits with status 0 only after `quit`. A FIFO that does not open, a snapshot that fails to write, a `quit` while a snapshot still waits, and every other end of the session exit with an error. Drive it through the control FIFO:
   * `key cmd+ctrl+f`, `key return`, `key esc` press the keys in order and release them in reverse order. Names are `cmd`, `ctrl`, `alt` or `opt`, `shift`, `return`, `esc`, `tab`, `space`, `backspace`, `delete`, `home`, `end`, `pageup`, `pagedown`, `left`, `right`, `up`, `down`, `f1` to `f20`, `plus` for the `+` key (as in `cmd+plus`), or one character.
   * `type TEXT` types the rest of the line, spaces included. Only a line that starts with `#` is a comment, so a `#` later in a line, as in `snapshot /tmp/a#1.png`, is part of it.

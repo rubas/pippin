@@ -22,6 +22,10 @@ const BLOCK: usize = 16;
 /// How far ahead of the expected receive counter a MAC may match. The server
 /// occasionally skips counter values.
 const RECV_WINDOW: u32 = 6;
+/// The most message bytes one record carries: 65,498. The u16 ciphertext
+/// length holds whole cipher blocks, so a record has at most 65,520 bytes for
+/// the message length, the message, and the MAC.
+const MAX_RECORD_MSG: usize = u16::MAX as usize / BLOCK * BLOCK - 2 - MAC_LEN;
 
 type CbcEnc = cbc::Encryptor<Aes128>;
 type CbcDec = cbc::Decryptor<Aes128>;
@@ -68,24 +72,36 @@ impl RecordSealer {
         Self { cbc: CbcEnc::new(&keys.key.into(), &keys.iv.into()), seq: 0 }
     }
 
-    /// Wraps one message. Panics only if `msg` exceeds the u16 length field,
-    /// which no client message comes close to.
+    /// Wraps one message into as many records as it needs, each with at most
+    /// [`MAX_RECORD_MSG`] bytes. Only clipboard messages need more than one.
     pub fn seal(&mut self, msg: &[u8]) -> Vec<u8> {
-        assert!(msg.len() <= u16::MAX as usize, "record too large");
+        let records = msg.len().div_ceil(MAX_RECORD_MSG).max(1);
+        let mut out = Vec::with_capacity(msg.len() + records * (2 + 2 + BLOCK + MAC_LEN));
+        let mut rest = msg;
+        loop {
+            let (head, tail) = rest.split_at(rest.len().min(MAX_RECORD_MSG));
+            self.seal_record(head, &mut out);
+            rest = tail;
+            if rest.is_empty() {
+                return out;
+            }
+        }
+    }
+
+    fn seal_record(&mut self, msg: &[u8], out: &mut Vec<u8>) {
         let pad = (BLOCK - (2 + msg.len() + MAC_LEN) % BLOCK) % BLOCK;
         let ct_len = 2 + msg.len() + pad + MAC_LEN;
-        let mut out = Vec::with_capacity(2 + ct_len);
+        let start = out.len();
         out.extend_from_slice(&(ct_len as u16).to_be_bytes());
         out.extend_from_slice(&(msg.len() as u16).to_be_bytes());
         out.extend_from_slice(msg);
         out.resize(out.len() + pad, 0);
-        let tag = mac(self.seq, &out[2..]);
+        let tag = mac(self.seq, &out[start + 2..]);
         out.extend_from_slice(&tag);
-        for block in out[2..].as_chunks_mut::<BLOCK>().0 {
+        for block in out[start + 2..].as_chunks_mut::<BLOCK>().0 {
             self.cbc.encrypt_block_mut(GenericArray::from_mut_slice(block));
         }
         self.seq = self.seq.wrapping_add(1);
-        out
     }
 }
 
@@ -173,6 +189,42 @@ mod tests {
                 Opened::BadMac => panic!("mac mismatch"),
             }
         }
+    }
+
+    fn open_all(rx: &mut RecordOpener, wire: Vec<u8>) -> Vec<Vec<u8>> {
+        let len = wire.len() as u64;
+        let mut cur = io::Cursor::new(wire);
+        let mut msgs = Vec::new();
+        while cur.position() < len {
+            match rx.read(&mut cur).unwrap() {
+                Opened::Message(m) => msgs.push(m),
+                Opened::BadMac => panic!("mac mismatch"),
+            }
+        }
+        msgs
+    }
+
+    #[test]
+    fn message_of_65498_bytes_fills_one_record() {
+        assert_eq!(MAX_RECORD_MSG, 65_498);
+        let msg = vec![0x1f; 65_498];
+        let wire = RecordSealer::new(&keys()).seal(&msg);
+        assert_eq!(wire.len(), 2 + 65_520);
+        assert_eq!(open_all(&mut RecordOpener::new(&keys()), wire), [msg]);
+    }
+
+    #[test]
+    fn message_of_65499_bytes_splits_into_two_records() {
+        let msg: Vec<u8> = (0..65_499u32).map(|i| i as u8).collect();
+        let mut tx = RecordSealer::new(&keys());
+        let mut rx = RecordOpener::new(&keys());
+        let got = open_all(&mut rx, tx.seal(&msg));
+        assert_eq!(got.iter().map(Vec::len).collect::<Vec<_>>(), [65_498, 1]);
+        assert_eq!(got.concat(), msg);
+        // Both directions count the second record.
+        assert_eq!((tx.seq, rx.seq), (2, 2));
+        let next = tx.seal(b"next");
+        assert_eq!(open_all(&mut rx, next), [b"next".to_vec()]);
     }
 
     #[test]
