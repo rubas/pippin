@@ -406,8 +406,11 @@ impl ApplicationHandler<Tagged> for App {
                         tracing::trace!("uploaded {n} tiles in {:.2} ms", started.elapsed().as_secs_f64() * 1000.0);
                     }
                 }
-                if let Some(r) = &mut self.renderer {
-                    r.render();
+                if let Some(r) = &mut self.renderer
+                    && r.render()
+                    && let Some(s) = &self.session
+                {
+                    s.presented();
                 }
             }
             WindowEvent::Focused(false) => self.release_all(),
