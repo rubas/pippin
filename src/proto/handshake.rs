@@ -350,13 +350,17 @@ pub fn connect(p: &ConnectParams) -> Result<Negotiated> {
             Opened::Message(m) => m,
             Opened::BadMac => continue,
         };
-        match (msg.first(), parse_answer(&msg)) {
-            (Some(0x00), Some(c)) if !c.is_degenerate() => {
+        let answer = if msg.first() == Some(&0x00) { parse_answer(&msg) } else { None };
+        // The reader still gets the whole message: the update that carries
+        // the answer can carry the display layout and a cursor too.
+        pending.push(msg);
+        match answer {
+            Some(c) if !c.is_degenerate() => {
                 tracing::info!("encoder canvas {}x{} in {} tiles", c.width, c.height, c.tiles);
                 canvas = Some(c);
                 break;
             }
-            (Some(0x00), Some(c)) => {
+            Some(c) => {
                 tracing::debug!("degenerate canvas answer; re-offering");
                 canvas = Some(c);
                 if retries >= DEGENERATE_RETRIES {
@@ -368,7 +372,7 @@ pub fn connect(p: &ConnectParams) -> Result<Negotiated> {
                 s.write_all(&sealer.seal(&offer_msg))?;
                 deadline = Instant::now() + ANSWER_TIMEOUT;
             }
-            _ => pending.push(msg),
+            None => {}
         }
     }
 
