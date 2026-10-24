@@ -121,11 +121,11 @@ pub fn keysym(physical: PhysicalKey, logical: &Key, swap_ctrl_cmd: bool) -> Opti
     }
 }
 
-/// Keysym for a key name of the control FIFO: one character, a modifier
-/// (`cmd`, `ctrl`, `alt` or `opt`, `shift`, sent as the left key), or a named
-/// key (`return`, `esc`, `tab`, `space`, `backspace`, `delete`, `home`,
-/// `end`, `pageup`, `pagedown`, `left`, `right`, `up`, `down`, `f1` to
-/// `f20`).
+/// Keysym for a key name of the control FIFO: one character, `plus` for
+/// `+` (which joins the names of a shortcut), a modifier (`cmd`, `ctrl`,
+/// `alt` or `opt`, `shift`, sent as the left key), or a named key
+/// (`return`, `esc`, `tab`, `space`, `backspace`, `delete`, `home`, `end`,
+/// `pageup`, `pagedown`, `left`, `right`, `up`, `down`, `f1` to `f20`).
 pub fn by_name(name: &str) -> Option<u32> {
     let mut chars = name.chars();
     if let (Some(c), None) = (chars.next(), chars.next()) {
@@ -136,6 +136,7 @@ pub fn by_name(name: &str) -> Option<u32> {
         "ctrl" => return modifier_keysym(KeyCode::ControlLeft),
         "alt" | "opt" => return modifier_keysym(KeyCode::AltLeft),
         "shift" => return modifier_keysym(KeyCode::ShiftLeft),
+        "plus" => return Some(char_keysym('+')),
         _ => {}
     }
     use NamedKey::*;
@@ -174,6 +175,7 @@ mod tests {
         assert_eq!(by_name("esc"), Some(0xff1b));
         assert_eq!(by_name("f1"), Some(0xffbe));
         assert_eq!(by_name("f20"), Some(0xffd1));
+        assert_eq!(by_name("plus"), Some(0x2b));
         for bad in ["f0", "f21", "fx", "command", ""] {
             assert_eq!(by_name(bad), None, "{bad:?}");
         }
