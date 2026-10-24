@@ -131,15 +131,12 @@ pub fn by_name(name: &str) -> Option<u32> {
     if let (Some(c), None) = (chars.next(), chars.next()) {
         return Some(char_keysym(c));
     }
-    let modifier = match name {
-        "cmd" => Some(KeyCode::SuperLeft),
-        "ctrl" => Some(KeyCode::ControlLeft),
-        "alt" | "opt" => Some(KeyCode::AltLeft),
-        "shift" => Some(KeyCode::ShiftLeft),
-        _ => None,
-    };
-    if let Some(code) = modifier {
-        return modifier_keysym(code);
+    match name {
+        "cmd" => return modifier_keysym(KeyCode::SuperLeft),
+        "ctrl" => return modifier_keysym(KeyCode::ControlLeft),
+        "alt" | "opt" => return modifier_keysym(KeyCode::AltLeft),
+        "shift" => return modifier_keysym(KeyCode::ShiftLeft),
+        _ => {}
     }
     use NamedKey::*;
     const F_KEYS: [NamedKey; 20] =

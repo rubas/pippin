@@ -261,10 +261,7 @@ fn run(cli: Cli) -> Result<()> {
         },
         _ => bail!("the host and --user are required (or use --dialog)"),
     };
-    let viewer = match event_loop.as_mut() {
-        Some(event_loop) => Viewer::Window(event_loop),
-        None => Viewer::Headless,
-    };
+    let viewer = event_loop.as_mut().map_or(Viewer::Headless, Viewer::Window);
     connect(viewer, &cli, &store, &host, &user, password, source, save, false).map(drop)
 }
 

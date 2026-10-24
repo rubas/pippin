@@ -38,12 +38,12 @@ impl Canvas {
     /// The canvas in RGB at full resolution, once every tile has a picture.
     pub fn image(&self) -> Option<RgbImage> {
         let (_, height) = self.size?;
-        let tile_height = self.tiles.first()?.as_ref()?.height;
-        let tiles = self.tiles.get(..height.div_ceil(tile_height) as usize)?;
+        let first = self.tiles.first()?.as_ref()?;
+        let tiles = self.tiles.get(..height.div_ceil(first.height) as usize)?;
         if tiles.iter().any(Option::is_none) {
             return None;
         }
-        let mut img = RgbImage::new(tiles[0].as_ref()?.width, height);
+        let mut img = RgbImage::new(first.width, height);
         for (i, pic) in tiles.iter().flatten().enumerate() {
             let planes: Vec<_> = (0..pic.layout.planes()).map(|p| pic.plane(p)).collect();
             draw_tile(&mut img, i as u32 * pic.height, pic.layout, &planes);
