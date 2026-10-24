@@ -1,7 +1,8 @@
 // Prints the displays of the guest, one per line: first each online display
 // of CoreGraphics, with its size and origin in points, its vendor, and its
 // state, then the main display of CoreGraphics, which can be offline, then
-// each screen that AppKit gives to apps. Run with `osascript -l JavaScript`.
+// each screen that AppKit gives to apps, with its pixels per point. Run with
+// `osascript -l JavaScript`.
 ObjC.import("AppKit");
 ObjC.import("CoreGraphics");
 
@@ -29,7 +30,7 @@ function screens() {
   return $.NSScreen.screens.js.map((s) => {
     const f = s.frame;
     const id = s.deviceDescription.objectForKey("NSScreenNumber").js;
-    return `screen 0x${id.toString(16)} ${f.size.width}x${f.size.height}+${f.origin.x}+${f.origin.y} ${s.localizedName.js}`;
+    return `screen 0x${id.toString(16)} ${f.size.width}x${f.size.height}+${f.origin.x}+${f.origin.y} ${s.backingScaleFactor}x ${s.localizedName.js}`;
   });
 }
 

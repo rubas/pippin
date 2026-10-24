@@ -30,11 +30,17 @@ async function checkLit(ctx: Context, name: string, png: string | undefined): Pr
 
 /**
  * Connects pippin, waits for the first picture, runs `body`, and quits. The
- * system log of `processes` in the guest goes to vm.log.
+ * system log of `processes` in the guest goes to vm.log. With `macDisplay`,
+ * pippin streams the Mac's own display.
  */
-async function connected(ctx: Context, processes: string[], body: (s: Session) => Promise<void>): Promise<void> {
+async function connected(
+  ctx: Context,
+  processes: string[],
+  macDisplay: boolean,
+  body: (s: Session) => Promise<void>,
+): Promise<void> {
   const start = await ctx.guest.now();
-  const session = await Session.start(ctx.guest.ip, ctx.login, ctx.out);
+  const session = await Session.start(ctx.guest.ip, ctx.login, ctx.out, macDisplay);
   ctx.onTeardown(() => session.close());
   try {
     const first = await session.snapshot("0-connected", 90_000);
@@ -50,7 +56,7 @@ async function connected(ctx: Context, processes: string[], body: (s: Session) =
 const smoke: Scenario = {
   about: "connect, take a snapshot of the desktop, and quit",
   async run(ctx) {
-    await connected(ctx, ["WindowServer", "screensharingd"], async (session) => {
+    await connected(ctx, ["WindowServer", "screensharingd"], false, async (session) => {
       await Bun.sleep(5000);
       const png = await session.snapshot("1-desktop");
       const got = png ? await size(png) : "none";
@@ -93,13 +99,38 @@ async function onlyVdisplay(ctx: Context): Promise<void> {
   ctx.check("only vdisplay", only(cg), cg.join("; "));
 }
 
-// While pippin is connected, its display must be the main display, and
-// online. pippin names it in its display request (src/proto/messages.rs).
-function checkMain(ctx: Context, displays: string): void {
+/**
+ * The main display of CoreGraphics, with its size in points and in pixels
+ * ("2560x1440" and "5120x2880") when AppKit gives it to apps as a screen.
+ */
+type Main = { id: string; online: boolean; points?: string; pixels?: string };
+
+function mainDisplay(displays: string): Main | undefined {
   const main = displays.match(/^main (\S+) (online|offline)$/m);
-  const pippin = displays.match(/^screen (\S+) .* pippin Virtual Display$/m);
-  const pass = main?.[2] === "online" && main[1] === pippin?.[1];
-  ctx.check("main display", pass, `main ${main?.slice(1).join(" ") ?? "none"}, pippin display ${pippin?.[1] ?? "none"}`);
+  if (!main) return undefined;
+  const screen = displays.match(new RegExp(`^screen ${main[1]} ((\\d+)x(\\d+))\\+\\S+ (\\d+)x `, "m"));
+  const pixels = screen && `${Number(screen[2]) * Number(screen[4])}x${Number(screen[3]) * Number(screen[4])}`;
+  return { id: main[1]!, online: main[2] === "online", points: screen?.[1], pixels: pixels ?? undefined };
+}
+
+function describe(main: Main | undefined): string {
+  return main ? `${main.id} ${main.online ? "online" : "offline"}` : "none";
+}
+
+// While pippin is connected, the display that it streams must be the main
+// display, and online. pippin names its own display in its display request
+// (src/proto/messages.rs). With --no-virtual-display, there is no pippin
+// display, and the main display stays the one from before the connect.
+function checkMain(ctx: Context, macDisplay: boolean, before: string, connected: string): void {
+  const main = mainDisplay(connected);
+  const pippin = connected.match(/^screen (\S+) .* pippin Virtual Display$/m)?.[1];
+  if (!macDisplay) {
+    const pass = main?.online === true && main.id === pippin;
+    return ctx.check("main display", pass, `main ${describe(main)}, pippin display ${pippin ?? "none"}`);
+  }
+  const was = mainDisplay(before);
+  const pass = main?.online === true && main.id === was?.id && pippin === undefined;
+  ctx.check("main display", pass, `main ${describe(main)}, before the connect ${describe(was)}, pippin display ${pippin ?? "none"}`);
 }
 
 const APP = "TextEdit";
@@ -108,9 +139,16 @@ const APP = "TextEdit";
 // before it.
 const SETTLED_S = 3;
 
-function fullscreen(vdisplay: boolean): Scenario {
+/**
+ * Puts a window into native fullscreen. With `vdisplay`, the mini's virtual
+ * display is the only display of the VM. With `macDisplay`, pippin streams
+ * that display (--no-virtual-display) instead of its own: the window must
+ * then cover the main display, and the frame must show all of it.
+ */
+function fullscreen(vdisplay: boolean, macDisplay = false): Scenario {
+  const streams = macDisplay ? ", and pippin streams the Mac's own display" : "";
   return {
-    about: `put a ${APP} window into native fullscreen, ${vdisplay ? "with" : "without"} the mini's vdisplay`,
+    about: `put a ${APP} window into native fullscreen, ${vdisplay ? "with" : "without"} the mini's vdisplay${streams}`,
     async run(ctx) {
       let window: string | undefined, full: string | undefined;
       let fullAt = 0;
@@ -118,11 +156,16 @@ function fullscreen(vdisplay: boolean): Scenario {
         await startVdisplay(ctx);
         await onlyVdisplay(ctx);
       }
-      await Bun.write(`${ctx.out}/displays-before.txt`, await ctx.guest.displays());
-      await connected(ctx, ["WindowServer", "screensharingd", APP], async (session) => {
+      const before = await ctx.guest.displays();
+      await Bun.write(`${ctx.out}/displays-before.txt`, before);
+      await connected(ctx, ["WindowServer", "screensharingd", APP], macDisplay, async (session) => {
         const displays = await ctx.guest.displays();
         await Bun.write(`${ctx.out}/displays-connected.txt`, displays);
-        checkMain(ctx, displays);
+        checkMain(ctx, macDisplay, before, displays);
+        // The window and the frame must cover the display that pippin streams.
+        const main = mainDisplay(displays);
+        const points = macDisplay ? main?.points : SIZE;
+        const pixels = macDisplay ? main?.pixels : SIZE;
         await ctx.guest.put("/tmp/pippin-e2e.txt", "pippin e2e: this window goes into fullscreen.\n");
         await ctx.guest.sh(`open -a ${APP} /tmp/pippin-e2e.txt`);
         await Bun.sleep(3000);
@@ -135,7 +178,10 @@ function fullscreen(vdisplay: boolean): Scenario {
         fullAt = Date.now() / 1000;
         await Bun.write(`${ctx.out}/displays-fullscreen.txt`, await ctx.guest.displays());
         const windows = (await ctx.guest.jxa("windows.js", [APP])).trim().split("\n");
-        ctx.check("app is in fullscreen", windows.includes(`${SIZE}+0+0`), `windows of ${APP}: ${windows.join(", ")}`);
+        const shown = `windows of ${APP}: ${windows.join(", ")}; display ${points ?? "unknown"}`;
+        ctx.check("app is in fullscreen", points !== undefined && windows.includes(`${points}+0+0`), shown);
+        const got = full ? await size(full) : "none";
+        ctx.check("frame size", got === pixels, `${got}, display ${pixels ?? "unknown"} pixels`);
         await checkLit(ctx, "fullscreen frame", full);
       });
       // A frozen stream would show an old picture: the fullscreen snapshot
@@ -160,4 +206,5 @@ export const SCENARIOS: Record<string, Scenario> = {
   smoke,
   fullscreen: fullscreen(true),
   "fullscreen-no-vdisplay": fullscreen(false),
+  "fullscreen-own-display": fullscreen(true, true),
 };
