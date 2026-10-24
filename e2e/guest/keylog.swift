@@ -1,9 +1,11 @@
 // keylog: selects the keyboard input source in the second argument, such as
-// com.apple.keylayout.SwissGerman, and covers the main display with one text
+// org.unknown.keylayout.DeutschNeo2, and covers the main display with one text
 // view. It appends lines to the file in the first argument: `source <id>`
-// with the input source in use, `ready` once the window shows, `text <json>`
-// with the whole text after each change, and `flags <names>` with the held
-// modifiers (command, option, control, shift) after each modifier change.
+// with the input source in use, `ready` once the window shows, `key <code>
+// flags <hex> <json>` with the key code, the modifier flags, and the
+// characters of each key press, `text <json>` with the whole text after each
+// change, and `flags <names>` with the held modifiers (command, option,
+// control, shift) after each modifier change.
 // Run it in an app bundle with `open`, so that it gets a window in the login
 // session.
 //
@@ -25,9 +27,15 @@ func sourceID(_ source: TISInputSource) -> String {
 
 let wanted = CommandLine.arguments[2]
 let filter = [kTISPropertyInputSourceID: wanted] as CFDictionary
-if let source = (TISCreateInputSourceList(filter, true).takeRetainedValue() as! [TISInputSource]).first {
-  TISEnableInputSource(source)
-  TISSelectInputSource(source)
+// A layout that was just installed can be selected once the agent of the
+// input sources has started again.
+for _ in 0..<50 {
+  if let source = (TISCreateInputSourceList(filter, true)?.takeRetainedValue() as? [TISInputSource])?.first,
+    TISEnableInputSource(source) == noErr, TISSelectInputSource(source) == noErr
+  {
+    break
+  }
+  usleep(200_000)
 }
 write("source \(sourceID(TISCopyCurrentKeyboardLayoutInputSource().takeRetainedValue()))")
 
@@ -39,6 +47,13 @@ final class View: NSTextView, NSTextViewDelegate {
     let held = names.filter { event.modifierFlags.contains($0.0) }.map { $0.1 }
     write("flags \(held.joined(separator: " "))")
     super.flagsChanged(with: event)
+  }
+
+  override func keyDown(with event: NSEvent) {
+    let chars = try! JSONEncoder().encode(event.characters ?? "")
+    let flags = String(event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue, radix: 16)
+    write("key \(event.keyCode) flags \(flags) \(String(data: chars, encoding: .utf8)!)")
+    super.keyDown(with: event)
   }
 
   func textDidChange(_ notification: Notification) {

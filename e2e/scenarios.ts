@@ -264,28 +264,35 @@ const scroll: Scenario = {
   },
 };
 
-const SWISS_GERMAN = "com.apple.keylayout.SwissGerman";
-// What pippin sends for the Swiss German layout on Linux: AltGr characters,
-// the text of dead keys, and umlauts. Each lone accent stands before a letter
-// that it could take, so the text shows when the Mac starts a dead key of
-// its own instead of typing the accent.
-const SWISS_TEXT = "@#|\\[]{}~ ^e `a ´e ¨u ~n êàéèñ äöü ÄÖÜ ç€§°";
+// Dominic types with Neo 2 on both sides. The VM gets the Mac layout of Neo 2
+// from the mini, in the same place.
+const NEO_LAYOUT = "/Library/Keyboard Layouts/neo.keylayout";
+const NEO = "org.unknown.keylayout.DeutschNeo2";
+// What pippin sends for Neo 2 on Linux: the symbols of layer 3, the text of
+// the dead keys before a vowel and before a space, and the letters of layer 1
+// and 2. Each lone accent stands before a letter that it could take, so the
+// text shows when the Mac starts a dead key of its own instead of typing the
+// accent.
+const NEO_TEXT = "[]{}\\/|@#$%&*<>=~ _…!?()-:;\"'+ ^a `a ´a ^ ` ´ âàá êèé äöüß ÄÖÜẞ ñç€";
 
 const keyboard: Scenario = {
-  about: "type Swiss German text and press Command and Option, and see each reach a text view on a Mac with the Swiss German layout",
+  about: "type Neo 2 text and press Command and Option, and see each reach a text view on a Mac with the Neo 2 layout",
   async run(ctx) {
     await connected(ctx, ["WindowServer", "screensharingd", "ScreensharingAgent"], false, async (session) => {
-      const log = await openTool(ctx, "keylog", [SWISS_GERMAN]);
+      await ctx.guest.put("/tmp/neo.keylayout", await readFile(`'${NEO_LAYOUT}'`));
+      // The input sources of the session see a new layout once their agents start again.
+      await ctx.guest.sh(`sudo -n install -m 644 /tmp/neo.keylayout '${NEO_LAYOUT}' && killall TextInputMenuAgent TextInputSwitcher`);
+      const log = await openTool(ctx, "keylog", [NEO]);
       const source = (await log()).find((l) => l.startsWith("source "));
-      ctx.check("input source", source === `source ${SWISS_GERMAN}`, source ?? "none");
+      ctx.check("input source", source === `source ${NEO}`, source ?? "none");
       session.send("pointer 200 200");
       session.send("click");
       await Bun.sleep(1000);
-      session.send(`type ${SWISS_TEXT}`);
+      session.send(`type ${NEO_TEXT}`);
       await Bun.sleep(3000);
       const last = (await log()).findLast((l) => l.startsWith("text "));
       const text = last ? (JSON.parse(last.slice(5)) as string) : undefined;
-      ctx.check("swiss german text", text === SWISS_TEXT, `typed ${JSON.stringify(text ?? null)}`);
+      ctx.check("neo 2 text", text === NEO_TEXT, `typed ${JSON.stringify(text ?? null)}`);
       for (const [combo, held] of [["opt", "option"], ["cmd", "command"]] as const) {
         const before = (await log()).length;
         session.send(`key ${combo}`);
