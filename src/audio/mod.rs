@@ -60,12 +60,14 @@ impl Jitter {
     fn push(&mut self, pcm: &[i16]) -> bool {
         let sound = pcm.iter().any(|&s| s != 0);
         // The host sends digital silence whenever nothing plays; it's
-        // indistinguishable from the underrun fill, so skip it. The silence
-        // right after a sound shorter than the target tops the queue up to
-        // the target, else that sound never starts.
+        // indistinguishable from the underrun fill, so skip it. Keep the
+        // silence after a sound: it keeps the gap to the next sound, and it
+        // fills a sound shorter than the target up to the target, else that
+        // sound never starts. Before the device plays, the queue stops at
+        // the target, so the trim never cuts the sound away.
         if sound {
             self.last_sound = Some(Instant::now());
-        } else if self.primed || self.queue.is_empty() || self.queue.len() >= samples(TARGET) {
+        } else if self.queue.is_empty() || (!self.primed && self.queue.len() >= samples(TARGET)) {
             return false;
         }
         self.queue.extend(pcm);
@@ -305,38 +307,44 @@ mod tests {
         assert_eq!(j.queue.len(), samples(TARGET));
     }
 
-    /// Feeds `sound_ms` of sound and then host silence, in 10 ms packets.
-    /// The device opens after `open_after` packets and then pulls one 10 ms
-    /// period after each packet. Returns the milliseconds of sound played.
-    fn sound_played_ms(sound_ms: usize, open_after: usize) -> usize {
+    /// Feeds `input` as 10 ms packets, `#` for sound and `.` for host
+    /// silence, and then 1 s of silence. The device opens after `open_after`
+    /// packets and then pulls one 10 ms period after each packet. Returns
+    /// what it played in the same notation, from the first to the last sound.
+    fn play(input: &str, open_after: usize) -> String {
         let mut j = Jitter::default();
         let sound = vec![1000i16; 480 * CHANNELS];
         let silence = vec![0i16; 480 * CHANNELS];
         let mut out = vec![0f32; 480 * CHANNELS];
-        let mut played = 0;
-        for i in 0..100 {
-            j.push(if i < sound_ms / 10 { &sound } else { &silence });
+        let mut played = String::new();
+        for (i, c) in input.chars().chain(std::iter::repeat_n('.', 100)).enumerate() {
+            j.push(if c == '#' { &sound } else { &silence });
             if i >= open_after {
                 j.pull(&mut out);
-                played += out.iter().filter(|&&s| s > 0.0).count();
+                played.push(if out.iter().all(|&s| s > 0.0) { '#' } else { '.' });
             }
         }
-        played / (CHANNELS * SAMPLE_RATE as usize / 1000)
+        played.trim_matches('.').to_string()
     }
 
     #[test]
     fn a_50ms_sound_plays_in_full() {
-        assert_eq!(sound_played_ms(50, 0), 50);
+        assert_eq!(play("#####", 0), "#####");
     }
 
     #[test]
     fn a_20ms_click_plays_in_full() {
-        assert_eq!(sound_played_ms(20, 0), 20);
+        assert_eq!(play("##", 0), "##");
     }
 
     #[test]
     fn a_20ms_click_plays_when_the_device_opens_150ms_late() {
-        assert_eq!(sound_played_ms(20, 15), 20);
+        assert_eq!(play("##", 15), "##");
+    }
+
+    #[test]
+    fn a_20ms_gap_between_two_sounds_is_kept() {
+        assert_eq!(play("####..####", 0), "####..####");
     }
 
     #[test]
