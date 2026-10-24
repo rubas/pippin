@@ -169,11 +169,11 @@ impl FrameStore {
         let mut slots = self.slots.lock();
         let mut taken = self.taken.lock();
         let mut pictures = Vec::new();
-        for (tile, (pic, received)) in slots.iter_mut().enumerate().filter_map(|(i, s)| s.take().map(|p| (i, p))) {
-            if taken.len() < metrics::MAX_SAMPLES {
-                taken.push(received);
+        for (tile, slot) in slots.iter_mut().enumerate() {
+            if let Some((pic, received)) = slot.take() {
+                metrics::push_sample(&mut taken, received);
+                pictures.push((tile, pic));
             }
-            pictures.push((tile, pic));
         }
         pictures
     }

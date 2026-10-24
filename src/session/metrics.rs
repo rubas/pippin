@@ -131,7 +131,7 @@ const FROZEN_AFTER_MS: u64 = 100;
 /// Waiting for a keyframe counts as frozen only while video flows.
 const FLOWING_MS: u64 = 1500;
 /// Latency samples kept between lines at most.
-pub(super) const MAX_SAMPLES: usize = 4096;
+const MAX_SAMPLES: usize = 4096;
 
 /// Shared counters. Monotonic ones are swapped to zero by the stats writer,
 /// its only reader.
@@ -223,7 +223,7 @@ impl Metrics {
     /// A NACKed packet arrived, `after` its first NACK.
     pub fn nack_arrived(&self, after: Duration) {
         self.nacked_arrived.fetch_add(1, Ordering::Relaxed);
-        push_sample(&self.nack_latency, after);
+        push_sample(&mut self.nack_latency.lock(), after);
     }
 
     pub fn set_answer_ltrp(&self, ltrp: Option<bool>) {
@@ -252,12 +252,12 @@ impl Metrics {
 
     /// A picture came out of the decoder `after` its first packet arrived.
     pub fn decoded_after(&self, after: Duration) {
-        push_sample(&self.decode_latency, after);
+        push_sample(&mut self.decode_latency.lock(), after);
     }
 
     /// A picture was on screen `after` its first packet arrived.
     pub fn presented_after(&self, after: Duration) {
-        push_sample(&self.present_latency, after);
+        push_sample(&mut self.present_latency.lock(), after);
     }
 
     pub fn tile_packet(&self, tile: usize, now_ms: u64) {
@@ -345,17 +345,15 @@ impl Outages {
             && epoch > started
         {
             self.open = None;
-            if self.samples.len() < MAX_SAMPLES {
-                self.samples.push(at.saturating_duration_since(t));
-            }
+            push_sample(&mut self.samples, at.saturating_duration_since(t));
         }
     }
 }
 
-fn push_sample(samples: &Mutex<Vec<Duration>>, d: Duration) {
-    let mut s = samples.lock();
-    if s.len() < MAX_SAMPLES {
-        s.push(d);
+/// Keeps `sample` while `samples` holds fewer than [`MAX_SAMPLES`].
+pub(super) fn push_sample<T>(samples: &mut Vec<T>, sample: T) {
+    if samples.len() < MAX_SAMPLES {
+        samples.push(sample);
     }
 }
 
