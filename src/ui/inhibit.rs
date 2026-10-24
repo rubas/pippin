@@ -55,7 +55,6 @@ impl ShortcutInhibitor {
         };
         let mut this = Self { conn, queue, manager, seat, surface, inhibitor: None };
         this.inhibit();
-        tracing::info!("keyboard shortcuts go to the Mac; Ctrl+Alt+Shift+Z gives them back to the compositor");
         Some(this)
     }
 
@@ -71,10 +70,7 @@ impl ShortcutInhibitor {
                 self.flush();
                 tracing::info!("keyboard shortcuts go to the compositor; Ctrl+Alt+Shift+Z gives them to the Mac");
             }
-            None => {
-                self.inhibit();
-                tracing::info!("keyboard shortcuts go to the Mac; Ctrl+Alt+Shift+Z gives them back to the compositor");
-            }
+            None => self.inhibit(),
         }
     }
 
@@ -82,6 +78,7 @@ impl ShortcutInhibitor {
         let qh = self.queue.handle();
         self.inhibitor = Some(self.manager.inhibit_shortcuts(&self.surface, &self.seat, &qh, ()));
         self.flush();
+        tracing::info!("keyboard shortcuts go to the Mac; Ctrl+Alt+Shift+Z gives them back to the compositor");
     }
 
     fn flush(&self) {

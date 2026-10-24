@@ -286,14 +286,11 @@ const keyboard: Scenario = {
       const last = (await log()).findLast((l) => l.startsWith("text "));
       const text = last ? (JSON.parse(last.slice(5)) as string) : undefined;
       ctx.check("swiss german text", text === SWISS_TEXT, `typed ${JSON.stringify(text ?? null)}`);
-      const flags = async (combo: string) => {
+      for (const [combo, held] of [["opt", "option"], ["cmd", "command"]] as const) {
         const before = (await log()).length;
         session.send(`key ${combo}`);
         await Bun.sleep(1000);
-        return (await log()).slice(before).filter((l) => l.startsWith("flags "));
-      };
-      for (const [combo, held] of [["opt", "option"], ["cmd", "command"]] as const) {
-        const got = await flags(combo);
+        const got = (await log()).slice(before).filter((l) => l.startsWith("flags "));
         ctx.check(`${combo} key`, got[0] === `flags ${held}`, got.join(", ") || "no modifier change");
       }
       await session.snapshot("1-keylog");
