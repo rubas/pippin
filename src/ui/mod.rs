@@ -170,7 +170,9 @@ impl App {
         let base = ev.key_without_modifiers();
         let input = KeyInput {
             code,
+            location: ev.location,
             down: ev.state == ElementState::Pressed,
+            repeat: ev.repeat,
             logical: &ev.logical_key,
             base: &base,
             text: ev.text.as_deref(),

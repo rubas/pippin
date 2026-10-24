@@ -12,9 +12,9 @@
 //! Meta is Option, and Alt is Command too. So the Alt keys go as Meta. AltGr
 //! only selects the character here, and never reaches the Mac.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey, NativeKey};
 
 pub const XK_SHIFT_L: u32 = 0xffe1;
 pub const XK_SHIFT_R: u32 = 0xffe2;
@@ -24,6 +24,8 @@ pub const XK_META_L: u32 = 0xffe7;
 pub const XK_META_R: u32 = 0xffe8;
 pub const XK_SUPER_L: u32 = 0xffeb;
 pub const XK_SUPER_R: u32 = 0xffec;
+/// Mod4 of the Neo layout, whose level holds the arrow keys.
+const XK_ISO_LEVEL5_SHIFT: u32 = 0xfe11;
 
 /// Keysym for a typed character: Latin-1 maps directly, everything else
 /// uses the Unicode keysym range.
@@ -80,19 +82,24 @@ fn named_keysym(k: NamedKey) -> Option<u32> {
     })
 }
 
-/// Modifier keys by physical position (left/right matters to the host).
-fn modifier_keysym(code: KeyCode) -> Option<u32> {
-    Some(match code {
-        KeyCode::ShiftLeft => XK_SHIFT_L,
-        KeyCode::ShiftRight => XK_SHIFT_R,
-        KeyCode::ControlLeft => XK_CONTROL_L,
-        KeyCode::ControlRight => XK_CONTROL_R,
-        KeyCode::AltLeft => XK_META_L,
-        KeyCode::AltRight => XK_META_R,
-        KeyCode::SuperLeft => XK_SUPER_L,
-        KeyCode::SuperRight => XK_SUPER_R,
+/// A modifier key by what it does in the local layout, so that a key that
+/// the layout moves, such as Right Alt as Super with `altwin:swap_ralt_rwin`,
+/// goes as that modifier. The side matters to the Mac.
+fn modifier_keysym(key: &Key, location: KeyLocation) -> Option<u32> {
+    let (left, right) = match key {
+        Key::Named(NamedKey::Shift) => (XK_SHIFT_L, XK_SHIFT_R),
+        Key::Named(NamedKey::Control) => (XK_CONTROL_L, XK_CONTROL_R),
+        Key::Named(NamedKey::Alt) => (XK_META_L, XK_META_R),
+        Key::Named(NamedKey::Super) => (XK_SUPER_L, XK_SUPER_R),
         _ => return None,
-    })
+    };
+    Some(if location == KeyLocation::Right { right } else { left })
+}
+
+/// A key that selects a level of the local layout: AltGr, or Mod4 of Neo.
+/// It only selects the key here, and never reaches the Mac.
+fn selects_level(key: &Key) -> bool {
+    matches!(key, Key::Named(NamedKey::AltGraph) | Key::Unidentified(NativeKey::Xkb(XK_ISO_LEVEL5_SHIFT)))
 }
 
 /// Keypad keys, sent as their main-keyboard equivalents so they work the
@@ -120,7 +127,10 @@ fn key_keysym(key: &Key) -> Option<u32> {
 /// One key event of the window, as the mapping reads it.
 pub struct KeyInput<'a> {
     pub code: KeyCode,
+    pub location: KeyLocation,
     pub down: bool,
+    /// A press that the local key repeat sent.
+    pub repeat: bool,
     /// The key with the held modifiers and a pending dead key applied.
     pub logical: &'a Key,
     /// The key at the base level of the layout, for shortcuts.
@@ -154,11 +164,10 @@ fn toggles_shortcuts(k: &KeyInput) -> bool {
     m.control_key() && m.alt_key() && m.shift_key() && matches!(k.base, Key::Character(s) if s.eq_ignore_ascii_case("z"))
 }
 
-fn press(k: &KeyInput, swap_ctrl_cmd: bool) -> Option<Press> {
-    if *k.logical == Key::Named(NamedKey::AltGraph) {
-        return None;
-    }
-    if let Some(ks) = modifier_keysym(k.code) {
+/// `levelled`: a key that selects a level is held, so a shortcut goes by the
+/// key of that level, such as Command+[ for Super+AltGr+ü.
+fn press(k: &KeyInput, swap_ctrl_cmd: bool, levelled: bool) -> Option<Press> {
+    if let Some(ks) = modifier_keysym(k.logical, k.location) {
         return Some(Press::Hold(match (swap_ctrl_cmd, ks) {
             (true, XK_CONTROL_L) => XK_SUPER_L,
             (true, XK_CONTROL_R) => XK_SUPER_R,
@@ -172,15 +181,19 @@ fn press(k: &KeyInput, swap_ctrl_cmd: bool) -> Option<Press> {
     }
     let m = k.mods;
     if m.control_key() || m.alt_key() || m.super_key() {
-        return key_keysym(k.base).map(Press::Hold);
+        return key_keysym(if levelled { k.logical } else { k.base }).map(Press::Hold);
     }
     // Control characters, such as the "\r" of Enter, go by the named key.
     if let Some(text) = k.text.filter(|t| !t.is_empty() && !t.chars().any(char::is_control)) {
-        let mut keys: Vec<u32> = text.chars().map(char_keysym).collect();
-        return Some(match keys.len() {
-            1 => Press::Hold(keys.remove(0)),
+        let keys: Vec<u32> = text.chars().map(char_keysym).collect();
+        return Some(match keys[..] {
+            [ks] => Press::Hold(ks),
             _ => Press::Type(keys),
         });
+    }
+    // Space types its text, and it has none while a Compose sequence waits.
+    if *k.logical == Key::Named(NamedKey::Space) {
+        return None;
     }
     key_keysym(k.logical).map(Press::Hold)
 }
@@ -191,24 +204,35 @@ pub struct Keyboard {
     /// Keysym sent for each held physical key, so releases match presses
     /// even if modifiers changed in between.
     held: HashMap<KeyCode, u32>,
+    /// The held keys that select a level of the layout.
+    levels: HashSet<KeyCode>,
 }
 
 impl Keyboard {
     pub fn new(swap_ctrl_cmd: bool) -> Self {
-        Self { swap_ctrl_cmd, held: HashMap::new() }
+        Self { swap_ctrl_cmd, held: HashMap::new(), levels: HashSet::new() }
     }
 
     pub fn key(&mut self, k: &KeyInput) -> Vec<Out> {
         if !k.down {
+            self.levels.remove(&k.code);
             return self.held.remove(&k.code).map(Out::Up).into_iter().collect();
         }
-        // The Mac sees the modifiers of the combination go up, and never its Z.
+        if selects_level(k.logical) {
+            self.levels.insert(k.code);
+            return Vec::new();
+        }
+        // The Mac sees the modifiers of the combination go up, and never its
+        // Z. A held Z toggles once.
         if toggles_shortcuts(k) {
+            if k.repeat {
+                return Vec::new();
+            }
             let mut out = self.release_all();
             out.push(Out::ToggleShortcuts);
             return out;
         }
-        match press(k, self.swap_ctrl_cmd) {
+        match press(k, self.swap_ctrl_cmd, !self.levels.is_empty()) {
             None => Vec::new(),
             Some(Press::Hold(ks)) => {
                 let mut out = Vec::new();
@@ -227,6 +251,7 @@ impl Keyboard {
     /// Releases every key held on the Mac, e.g. when the focus goes while a
     /// shortcut is down and its release would never arrive.
     pub fn release_all(&mut self) -> Vec<Out> {
+        self.levels.clear();
         self.held.drain().map(|(_, ks)| Out::Up(ks)).collect()
     }
 
@@ -248,10 +273,10 @@ pub fn by_name(name: &str) -> Option<u32> {
         return Some(char_keysym(c));
     }
     match name {
-        "cmd" => return modifier_keysym(KeyCode::SuperLeft),
-        "ctrl" => return modifier_keysym(KeyCode::ControlLeft),
-        "alt" | "opt" => return modifier_keysym(KeyCode::AltLeft),
-        "shift" => return modifier_keysym(KeyCode::ShiftLeft),
+        "cmd" => return Some(XK_SUPER_L),
+        "ctrl" => return Some(XK_CONTROL_L),
+        "alt" | "opt" => return Some(XK_META_L),
+        "shift" => return Some(XK_SHIFT_L),
         "plus" => return Some(char_keysym('+')),
         _ => {}
     }
@@ -277,7 +302,6 @@ pub fn by_name(name: &str) -> Option<u32> {
     })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +314,7 @@ mod tests {
     /// A key event of the Swiss German layout on Linux, as winit gives it.
     struct Ev {
         code: KeyCode,
+        location: KeyLocation,
         logical: Key,
         base: Key,
         text: Option<String>,
@@ -298,20 +323,24 @@ mod tests {
     impl Ev {
         /// A key that commits `text`.
         fn text(code: KeyCode, base: &str, text: &str) -> Self {
-            Self { code, logical: ch(text), base: ch(base), text: Some(text.into()) }
+            Self { code, location: KeyLocation::Standard, logical: ch(text), base: ch(base), text: Some(text.into()) }
         }
 
         /// A dead key, which commits nothing.
         fn dead(code: KeyCode, base: &str, accent: char) -> Self {
-            Self { code, logical: Key::Dead(Some(accent)), base: ch(base), text: None }
+            Self { code, location: KeyLocation::Standard, logical: Key::Dead(Some(accent)), base: ch(base), text: None }
         }
 
         fn named(code: KeyCode, key: NamedKey, text: Option<&str>) -> Self {
-            Self { code, logical: Key::Named(key), base: Key::Named(key), text: text.map(Into::into) }
+            let location = KeyLocation::Standard;
+            Self { code, location, logical: Key::Named(key), base: Key::Named(key), text: text.map(Into::into) }
         }
 
+        /// A modifier, on the side of its physical key.
         fn modifier(code: KeyCode, key: NamedKey) -> Self {
-            Self::named(code, key, None)
+            let right = matches!(code, ShiftRight | ControlRight | AltRight | SuperRight);
+            let location = if right { KeyLocation::Right } else { KeyLocation::Left };
+            Self { location, ..Self::named(code, key, None) }
         }
     }
 
@@ -330,15 +359,16 @@ mod tests {
         let mut out = Vec::new();
         let mut send = |ev: &Ev, down: bool, mods: ModifiersState| {
             let text = ev.text.as_deref();
-            out.extend(kb.key(&KeyInput { code: ev.code, down, logical: &ev.logical, base: &ev.base, text, mods }));
+            let (code, location, logical, base) = (ev.code, ev.location, &ev.logical, &ev.base);
+            out.extend(kb.key(&KeyInput { code, location, down, repeat: false, logical, base, text, mods }));
         };
         for ev in chord {
             send(ev, true, mods);
-            mods |= match ev.code {
-                ShiftLeft | ShiftRight => ModifiersState::SHIFT,
-                ControlLeft | ControlRight => ModifiersState::CONTROL,
-                AltLeft => ModifiersState::ALT,
-                SuperLeft | SuperRight => ModifiersState::SUPER,
+            mods |= match ev.logical {
+                Key::Named(NamedKey::Shift) => ModifiersState::SHIFT,
+                Key::Named(NamedKey::Control) => ModifiersState::CONTROL,
+                Key::Named(NamedKey::Alt) => ModifiersState::ALT,
+                Key::Named(NamedKey::Super) => ModifiersState::SUPER,
                 _ => ModifiersState::empty(),
             };
         }
@@ -496,10 +526,75 @@ mod tests {
     }
 
     #[test]
+    fn holding_ctrl_alt_shift_z_toggles_the_shortcuts_once() {
+        let mut kb = Keyboard::new(false);
+        let (z, big_z) = (ch("z"), ch("Z"));
+        let mods = ModifiersState::CONTROL | ModifiersState::ALT | ModifiersState::SHIFT;
+        let z_press = |repeat| KeyInput {
+            code: KeyZ,
+            location: KeyLocation::Standard,
+            down: true,
+            repeat,
+            logical: &big_z,
+            base: &z,
+            text: Some("Z"),
+            mods,
+        };
+        assert_eq!(kb.key(&z_press(false)), [Out::ToggleShortcuts]);
+        assert_eq!(kb.key(&z_press(true)), []);
+        assert_eq!(kb.key(&z_press(true)), []);
+    }
+
+    #[test]
+    fn right_alt_as_super_with_swap_ralt_rwin_is_the_right_command_key() {
+        let right_alt_as_super = Ev::modifier(AltRight, NamedKey::Super);
+        let c = Ev::text(KeyC, "c", "c");
+        assert_eq!(
+            typed(vec![vec![right_alt_as_super, c]]),
+            [Out::Down(XK_SUPER_R), Out::Down(0x63), Out::Up(0x63), Out::Up(XK_SUPER_R)]
+        );
+    }
+
+    #[test]
+    fn super_altgr_ue_sends_a_left_bracket_with_command_held() {
+        let bracket = Ev::text(BracketLeft, "ü", "[");
+        let lbracket = '[' as u32;
+        assert_eq!(
+            typed(vec![vec![super_left(), altgr(), bracket]]),
+            [Out::Down(XK_SUPER_L), Out::Down(lbracket), Out::Up(lbracket), Out::Up(XK_SUPER_L)]
+        );
+    }
+
+    #[test]
+    fn ctrl_with_the_neo_mod4_left_arrow_sends_ctrl_left() {
+        let mod4 = Ev {
+            logical: Key::Unidentified(NativeKey::Xkb(XK_ISO_LEVEL5_SHIFT)),
+            base: Key::Unidentified(NativeKey::Xkb(XK_ISO_LEVEL5_SHIFT)),
+            ..Ev::named(IntlBackslash, NamedKey::AltGraph, None)
+        };
+        // Neo has i at the base level of this key.
+        let left = Ev { base: ch("i"), ..Ev::named(KeyS, NamedKey::ArrowLeft, None) };
+        assert_eq!(
+            typed(vec![vec![Ev::modifier(ControlLeft, NamedKey::Control), mod4, left]]),
+            [Out::Down(XK_CONTROL_L), Out::Down(0xff51), Out::Up(0xff51), Out::Up(XK_CONTROL_L)]
+        );
+    }
+
+    #[test]
+    fn compose_space_space_types_one_no_break_space() {
+        let compose = Ev::named(Tab, NamedKey::Compose, None);
+        let pending = Ev::named(Space, NamedKey::Space, None);
+        let done = Ev::named(Space, NamedKey::Space, Some("\u{a0}"));
+        assert_eq!(typed(vec![vec![compose], vec![pending], vec![done]]), tap('\u{a0}'));
+    }
+
+    #[test]
     fn a_release_matches_its_press_after_the_modifiers_change() {
         let mut kb = Keyboard::new(false);
         let (a, alt_a) = (ch("a"), ch("æ"));
-        let input = |down, logical, mods| KeyInput { code: KeyA, down, logical, base: &a, text: None, mods };
+        let location = KeyLocation::Standard;
+        let input =
+            |down, logical, mods| KeyInput { code: KeyA, location, down, repeat: false, logical, base: &a, text: None, mods };
         assert_eq!(kb.key(&input(true, &a, ModifiersState::empty())), [Out::Down('a' as u32)]);
         assert_eq!(kb.key(&input(false, &alt_a, ModifiersState::SHIFT)), [Out::Up('a' as u32)]);
     }

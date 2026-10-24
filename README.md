@@ -97,7 +97,7 @@ When prompted interactively, `pippin` offers to save your password to the deskto
 ### Keyboard
 On Wayland, `pippin` asks the compositor to pass its own shortcuts to the window while the window has the focus (`zwp_keyboard_shortcuts_inhibit_v1`). So `Super+Tab`, `Super+Space`, and `Super+C` reach the Mac as `⌘Tab`, `⌘Space`, and `⌘C`. Press `Ctrl+Alt+Shift+Z`, the capture toggle of Moonlight, to give the shortcuts back to the compositor, and press it again to take them. The Mac never sees this key combination. The compositor can keep some shortcuts for itself, such as a Hyprland bind with `dont_inhibit = true`.
 
-A printable key sends the character that your layout types on Linux, and the Mac types that character with its own layout. So `AltGr` combinations, dead keys, and umlauts give the same character on the Mac, also when the two layouts put it on different keys. `AltGr` itself never reaches the Mac.
+A printable key sends the character that your layout types on Linux, and the Mac types that character with its own layout. So `AltGr` combinations, dead keys, and umlauts give the same character on the Mac, also when the two layouts put it on different keys. `AltGr` itself never reaches the Mac. A modifier key goes as what your layout makes of it, so a right Alt key that `altwin:swap_ralt_rwin` makes `Super` is the Command key on the Mac.
 
 ## Performance & Troubleshooting
 
