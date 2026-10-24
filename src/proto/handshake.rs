@@ -31,6 +31,8 @@ pub enum SessionMode {
     Alt,
 }
 
+pub type OnOpen = Box<dyn Fn(&TcpStream) + Send + Sync>;
+
 pub struct ConnectParams {
     pub addr: SocketAddrV4,
     pub user: String,
@@ -41,7 +43,7 @@ pub struct ConnectParams {
     pub offer: OfferOptions,
     /// Shown each control connection as soon as it's open, so the caller
     /// can shut it down to abort a handshake stuck waiting on the host.
-    pub on_open: Option<Box<dyn Fn(&TcpStream) + Send + Sync>>,
+    pub on_open: Option<OnOpen>,
     /// Polled before each new connection; true abandons the handshake.
     pub stopped: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 }
