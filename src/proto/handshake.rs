@@ -433,9 +433,7 @@ mod tests {
     #[test]
     fn only_a_virtual_display_sends_a_display_request() {
         let req = DisplayRequest { width: 1600, height: 900, scale: 2.0, max_backing: (3840, 2160) };
-        let with = display_and_encodings(Some(&req));
-        assert_eq!(with[0], 0x1d, "SetDisplayConfiguration comes first");
-        assert_eq!(with, [messages::set_display_configuration(&req), messages::set_encodings()].concat());
+        assert_eq!(display_and_encodings(Some(&req)), [messages::set_display_configuration(&req), messages::set_encodings()].concat());
         assert_eq!(display_and_encodings(None), messages::set_encodings());
     }
 

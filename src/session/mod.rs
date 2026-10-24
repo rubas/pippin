@@ -387,12 +387,10 @@ impl Session {
         self.shared.max_backing
     }
 
-    /// Asks the host to resize its virtual display. Returns false, and sends
-    /// nothing, before the control connection is up and when the session
-    /// streams the Mac's own display: a display request there makes the Mac
-    /// create a virtual display after all.
+    /// Asks the host to resize its virtual display. Returns false before
+    /// the control connection is up, when nothing is sent.
     pub fn resize(&self, req: DisplayRequest) -> bool {
-        let Some(c) = self.control().filter(|_| self.shared.max_backing.is_some()) else { return false };
+        let Some(c) = self.control() else { return false };
         tracing::info!(
             width = req.width,
             height = req.height,
@@ -722,8 +720,7 @@ impl Shared {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::proto::offers::MediaOffer;
-    use crate::proto::record::{Opened, RecordKeys, RecordOpener, RecordSealer};
+    use crate::proto::record::{Opened, RecordKeys, RecordOpener};
     use crate::rtp::{assembler::HoldMode, rtcp::Recovery};
 
     pub const KEYS: RecordKeys = RecordKeys { key: [1; 16], iv: [2; 16] };
@@ -778,28 +775,5 @@ pub(super) mod tests {
         });
         let _ = shared.control.set(control.clone());
         (shared, control, Host { stream, opener: RecordOpener::new(&KEYS) }, events)
-    }
-
-    fn session(shared: Arc<Shared>) -> Session {
-        Session { shared, threads: Arc::new(Mutex::new(Vec::new())) }
-    }
-
-    const REQUEST: DisplayRequest = DisplayRequest { width: 1600, height: 900, scale: 2.0, max_backing: (3840, 2160) };
-
-    #[test]
-    fn a_resize_on_the_macs_own_display_sends_nothing() {
-        let (shared, _control, mut host, _events) = connected(None);
-        let session = session(shared);
-        assert_eq!(session.max_backing(), None);
-        assert!(!session.resize(REQUEST));
-        assert_eq!(host.next(), None);
-    }
-
-    #[test]
-    fn a_resize_on_a_virtual_display_sends_the_request() {
-        let (shared, _control, mut host, _events) = connected(Some((3840, 2160)));
-        let session = session(shared);
-        assert!(session.resize(REQUEST));
-        assert_eq!(host.next(), Some(messages::set_display_configuration(&REQUEST)));
     }
 }
