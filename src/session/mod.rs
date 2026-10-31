@@ -690,6 +690,9 @@ fn run(cfg: Config, display: Option<DisplayRequest>, shared: Arc<Shared>, thread
     // We write to the host every tick (cursor poll), so a host that went to
     // sleep or a vanished network shows up as unacknowledged data; give up
     // after this long instead of the kernel's ~15 minutes of retransmits.
+    // socket2 has this only on Linux, Android, Fuchsia and Cygwin; on Apple
+    // systems the kernel's own retransmit timeout applies.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     let _ = socket2::SockRef::from(&neg.stream).set_tcp_user_timeout(Some(CONTROL_ACK_TIMEOUT));
     let mut reader = neg.stream.try_clone()?;
     reader.set_read_timeout(None)?;
