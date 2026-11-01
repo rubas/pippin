@@ -21,7 +21,7 @@ const LOG = "~/Library/Logs/pippin-vm.log";
 // only one session at a time takes it, from any machine.
 const LOCK = "~/.cache/pippin-vm.lock";
 // Tart fails at once with this message while two VMs run. The CI runners
-// and the Safari VM share the two slots of the Mac.
+// share the two slots of the Mac.
 const SLOTS_FULL = "exceeds the system limit";
 const SLOT_WAIT_MIN = 10;
 
