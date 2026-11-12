@@ -22,7 +22,7 @@ jobs:
       - name: Install system libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config clang libclang-dev libavcodec-dev libavutil-dev libasound2-dev
+          sudo apt-get install -y pkg-config clang libclang-dev libavcodec-dev libavutil-dev libasound2-dev ffmpeg
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.toolchain }}
@@ -30,6 +30,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked
       - run: cargo test --locked
+      # The runner has no GPU, so the test decodes in software, as pippin does
+      # on a machine without CUDA and VAAPI. The streams are HEVC 4:4:4, which
+      # the Mac sends, and 4:2:0.
+      - name: Decode sample streams in software
+        run: |
+          dir="$RUNNER_TEMP/hevc"
+          mkdir "$dir"
+          for spec in t444:yuv444p t420:yuv420p; do
+            ffmpeg -v error -f lavfi -i testsrc2=size=1280x720:rate=30 -frames:v 30 \
+              -c:v libx265 -x265-params log-level=error -pix_fmt "${spec#*:}" -f hevc "$dir/${spec%:*}.hevc"
+          done
+          PIPPIN_TEST_HEVC_DIR="$dir" cargo test --locked decodes_sample_streams -- --ignored --nocapture
       - run: cargo clippy --locked --all-targets
         if: matrix.toolchain == 'stable'
 
