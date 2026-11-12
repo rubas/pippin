@@ -2,7 +2,7 @@
 // Development). The password goes to pippin on stdin only.
 
 import { closeSync, constants, existsSync, openSync, rmSync, writeSync } from "node:fs";
-import { capture, spawn } from "./proc";
+import { spawn } from "./proc";
 import type { Login } from "./login";
 
 const ROOT = `${import.meta.dir}/..`;
@@ -21,9 +21,21 @@ export async function build(log: string): Promise<void> {
   if (out.code !== 0) throw new Error(`cargo build failed; see ${log}`);
 }
 
-/** pippin binds fixed UDP ports, so only one session runs on a machine. */
-export async function running(): Promise<boolean> {
-  return (await spawn(["pgrep", "-x", "pippin"])).code === 0;
+/** pippin binds these fixed UDP ports (README, Single Instance / IPv4). */
+export const PORTS = [5900, 5901];
+
+/** The UDP ports of `ports` that a socket on this machine holds. */
+export async function held(ports: number[]): Promise<number[]> {
+  const out: number[] = [];
+  for (const port of ports) {
+    try {
+      (await Bun.udpSocket({ port })).close();
+    } catch (e) {
+      if ((e as { code?: string }).code !== "EADDRINUSE") throw e;
+      out.push(port);
+    }
+  }
+  return out;
 }
 
 /** The pictures that pippin decoded from `fromS` to `toS`, in Unix seconds, from --stats-json. */
@@ -50,28 +62,36 @@ export class Session {
    * `macDisplay`, pippin streams the Mac's own display (--no-virtual-display);
    * else the Mac creates a virtual display of SIZE for it.
    */
-  static async start(ip: string, login: Login, out: string, macDisplay = false): Promise<Session> {
+  static start(ip: string, login: Login, out: string, macDisplay = false): Session {
+    const argv = [BINARY, "--headless", ip, "--user", login.username, "--password-stdin"];
+    argv.push("--session", "share", "-v", "--stats-json", `${out}/stats.jsonl`);
+    argv.push(...(macDisplay ? ["--no-virtual-display"] : ["--size", SIZE]));
+    return Session.launch(argv, `${login.password}\n`, out);
+  }
+
+  /**
+   * Runs `argv` with `stdin` and a new control FIFO, and writes its output
+   * to pippin.log in `out`. The child gets no variable of the runner's shell:
+   * PIPPIN_PASSWORD would win over stdin, and PIPPIN_DUMP_HEVC would overwrite
+   * a capture. No step here waits, so no signal handler runs before the
+   * caller has registered `close`.
+   */
+  static launch(argv: string[], stdin: string, out: string): Session {
     const fifo = `${process.env.XDG_RUNTIME_DIR}/pippin-e2e-${process.pid}.ctl`;
     rmSync(fifo, { force: true });
-    await capture(["mkfifo", "-m", "600", fifo]);
+    const made = Bun.spawnSync(["mkfifo", "-m", "600", fifo]);
+    if (made.exitCode !== 0) throw new Error(`mkfifo ${fifo}: ${made.stderr.toString().trim()}`);
     // Read-write, like pippin: the open does not wait for a reader, and a
     // write waits in the pipe until pippin reads it.
     const fd = openSync(fifo, constants.O_RDWR | constants.O_NONBLOCK);
     const log = openSync(`${out}/pippin.log`, "a");
-    const argv = [BINARY, "--headless", ip, "--user", login.username, "--password-stdin"];
-    argv.push("--session", "share", "-v", "--stats-json", `${out}/stats.jsonl`);
-    argv.push(...(macDisplay ? ["--no-virtual-display"] : ["--size", SIZE]));
-    // PIPPIN_PASSWORD would win over stdin.
-    const { PIPPIN_PASSWORD: _, ...env } = process.env;
     const child = Bun.spawn(argv, {
-      stdin: "pipe",
+      stdin: Buffer.from(stdin),
       stdout: log,
       stderr: log,
-      env: { ...env, PIPPIN_CONTROL_FIFO: fifo },
+      env: { PIPPIN_CONTROL_FIFO: fifo },
     });
     closeSync(log);
-    child.stdin.write(`${login.password}\n`);
-    await child.stdin.end();
     return new Session(child, fifo, fd, out);
   }
 
@@ -105,9 +125,9 @@ export class Session {
 
   /** Ends pippin, if it still runs, and removes the FIFO. */
   close(): void {
-    if (this.child.exitCode === null) this.child.kill();
     if (this.closed) return;
     this.closed = true;
+    if (this.child.exitCode === null) this.child.kill();
     closeSync(this.fd);
     rmSync(this.fifo, { force: true });
   }

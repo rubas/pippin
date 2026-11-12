@@ -40,7 +40,7 @@ async function connected(
   body: (s: Session) => Promise<void>,
 ): Promise<void> {
   const start = await ctx.guest.now();
-  const session = await Session.start(ctx.guest.ip, ctx.login, ctx.out, macDisplay);
+  const session = Session.start(ctx.guest.ip, ctx.login, ctx.out, macDisplay);
   ctx.onTeardown(() => session.close());
   try {
     const first = await session.snapshot("0-connected", 90_000);

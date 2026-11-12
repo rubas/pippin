@@ -6,75 +6,18 @@
 //   bun e2e/run.ts down             stop and delete the clone that this machine started
 //   bun e2e/run.ts run <scenario>   build pippin, then up, the scenario, and down
 
-import { mkdirSync, rmSync } from "node:fs";
-import { homedir, hostname } from "node:os";
-import { Guest, STATE } from "./guest";
+import { mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { Guest } from "./guest";
+import { Hold, release, SESSION } from "./hold";
 import { readLogin, type Login } from "./login";
 import * as mini from "./mini";
-import { build, running } from "./pippin";
+import { build, held, PORTS } from "./pippin";
 import { SCENARIOS } from "./scenarios";
 import { buildBase } from "./setup";
 
-// The lock owner of the VM that this machine started, so that `down` stops
-// only that VM. It outlives a reboot, like the VM and the lock on the mini.
-const SESSION = `${STATE}/session`;
 // pippin must never connect to the mini itself: it shares Dominic's screen.
 const MINI_LAN = "192.168.5.239";
-
-/** Stops and deletes the VM of `owner`, and frees its lock, only while `owner` holds it. */
-async function release(owner: string): Promise<void> {
-  await mini.cancel(owner);
-  if ((await mini.holder()) === owner) {
-    await mini.stopAndDelete();
-    await mini.unlock(owner);
-  }
-  const file = Bun.file(SESSION);
-  if ((await file.exists()) && (await file.text()).trim() === owner) rmSync(SESSION);
-}
-
-/**
- * The hold of one invocation on the VM. It releases only what it took, once:
- * at the end, after a failure, or on a signal.
- */
-class Hold {
-  private owner: string | undefined;
-  private readonly teardown: (() => unknown)[] = [];
-  private releasing: Promise<void> | undefined;
-
-  constructor() {
-    for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
-      process.on(signal, () => void this.release().then(() => process.exit(130)));
-    }
-  }
-
-  async take(): Promise<void> {
-    if (await Bun.file(SESSION).exists()) {
-      throw new Error(`this machine holds the VM already (${SESSION}); run down first`);
-    }
-    // The owner is set before the lock call, so that a signal during it
-    // still frees the lock once the call ends.
-    this.owner = `${hostname()} ${process.pid} ${Date.now()}`;
-    mkdirSync(STATE, { recursive: true });
-    await Bun.write(SESSION, this.owner);
-    await mini.lock(this.owner);
-  }
-
-  /** Runs `f` before the release, also after a failure or a signal. */
-  onTeardown(f: () => unknown): void {
-    this.teardown.push(f);
-  }
-
-  release(): Promise<void> {
-    return (this.releasing ??= (async () => {
-      for (const f of this.teardown.reverse()) {
-        await Promise.resolve()
-          .then(f)
-          .catch((e) => console.error(`teardown: ${e.message}`));
-      }
-      if (this.owner) await release(this.owner);
-    })());
-  }
-}
 
 /** Takes the VM, and boots a fresh clone of the base. */
 async function up(hold: Hold): Promise<{ guest: Guest; login: Login }> {
@@ -123,7 +66,8 @@ function stamp(): string {
 async function run(name: string): Promise<boolean> {
   const scenario = SCENARIOS[name];
   if (!scenario) throw new Error(`no scenario ${name}; the scenarios are ${Object.keys(SCENARIOS).join(", ")}`);
-  if (await running()) throw new Error("another pippin runs on this machine, and it holds the fixed UDP ports");
+  const busy = await held(PORTS);
+  if (busy.length > 0) throw new Error(`pippin needs the UDP ports ${PORTS.join(" and ")}, and another program holds ${busy.join(" and ")}`);
   const out = `${homedir()}/.cache/tasks/pippin-e2e/${stamp()}-${name}`;
   mkdirSync(out, { recursive: true });
   console.log(`${name}: ${scenario.about}\noutput: ${out}`);
