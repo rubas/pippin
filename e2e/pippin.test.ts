@@ -75,7 +75,11 @@ test("a SIGTERM that arrives while a session starts ends its child, removes the 
   expect(readdirSync(run)).toEqual([]);
   // A child that outlived the runner writes its pid within this time.
   await Bun.sleep(500);
-  const pid = existsSync(pidFile) ? Number(readFileSync(pidFile, "utf8")) : undefined;
+  // The shell creates the file before it writes the pid, so a child that
+  // ends in between leaves it empty. That is no pid 0: kill(0) would signal
+  // the whole process group, the test runner too.
+  const text = existsSync(pidFile) ? readFileSync(pidFile, "utf8") : "";
+  const pid = text === "" ? undefined : Number(text);
   try {
     for (let i = 0; pid !== undefined && alive(pid) && i < 20; i++) await Bun.sleep(100);
     expect(pid !== undefined && alive(pid)).toBe(false);
