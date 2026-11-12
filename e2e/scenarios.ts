@@ -7,6 +7,7 @@ import type { Login } from "./login";
 import { readFile, swiftTool } from "./mini";
 import { decoded, Session, SIZE } from "./pippin";
 import { waitFor } from "./proc";
+import { waitBanner } from "./rfb";
 
 export type Context = {
   guest: Guest;
@@ -28,10 +29,18 @@ async function checkLit(ctx: Context, name: string, png: string | undefined): Pr
   ctx.check(name, share > LIT, `${Math.round(share * 100)} % not black, ${png}`);
 }
 
+// How long the VM may take to answer ssh, and then to send its RFB banner.
+const READY_MS = 120_000;
+
 /**
  * Connects pippin, waits for the first picture, runs `body`, and quits. The
  * system log of `processes` in the guest goes to vm.log. With `macDisplay`,
  * pippin streams the Mac's own display.
+ *
+ * pippin starts only once the VM answers ssh and Screen Sharing sends its RFB
+ * banner. In its first minute after a login, a VM can be too busy for both,
+ * and the first start of screensharingd in a clone also makes its key store.
+ * A VM that is too slow then fails the run, and no check of pippin.
  */
 async function connected(
   ctx: Context,
@@ -39,7 +48,9 @@ async function connected(
   macDisplay: boolean,
   body: (s: Session) => Promise<void>,
 ): Promise<void> {
-  const start = await ctx.guest.now();
+  const start = await waitFor("ssh to the VM", READY_MS, () => ctx.guest.now().catch(() => undefined));
+  const waited = await waitBanner(ctx.guest.ip, READY_MS);
+  ctx.check("screen sharing", true, `RFB banner after ${(waited / 1000).toFixed(1)} s`);
   const session = Session.start(ctx.guest.ip, ctx.login, ctx.out, macDisplay);
   ctx.onTeardown(() => session.close());
   try {
