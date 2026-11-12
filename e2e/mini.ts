@@ -1,6 +1,6 @@
 // The test VM on the Mac mini: a Tart clone, bridged on en0, so that pippin
-// on asrock reaches its Screen Sharing over the LAN. Every call goes to the
-// mini over ssh, as a zsh script on stdin.
+// reaches its Screen Sharing from another machine on the LAN. Every call goes
+// to the mini over ssh, as a zsh script on stdin.
 
 import { capture, captureBytes } from "./proc";
 
@@ -13,15 +13,15 @@ export const BUILD = "pippin-vm-new";
 /** The clone that `up` boots and `down` deletes. */
 export const RUN = "pippin-vm";
 
-// One launchd job in the GUI session of `rubas` runs `tart run` for the VM
-// of the moment. The job removes itself when the VM stops.
+// One launchd job of `agent`, the user of `ssh macmini`, runs `tart run` for
+// the VM of the moment. The job removes itself when the VM stops.
 const JOB = "dev.rubas.pippin-vm";
 const LOG = "~/Library/Logs/pippin-vm.log";
 // The owner file names the session that holds the VM. mkdir is atomic, so
 // only one session at a time takes it, from any machine.
 const LOCK = "~/.cache/pippin-vm.lock";
-// Tart fails at once with this message while two VMs run. The CI runners
-// share the two slots of the Mac.
+// Tart fails at once with this message while two VMs run: macOS allows no
+// third.
 const SLOTS_FULL = "exceeds the system limit";
 const SLOT_WAIT_MIN = 10;
 

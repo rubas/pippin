@@ -8,11 +8,10 @@
 
 import { mkdirSync, rmSync } from "node:fs";
 import { homedir, hostname } from "node:os";
-import { prepare } from "./container";
 import { Guest, STATE } from "./guest";
 import { readLogin, type Login } from "./login";
 import * as mini from "./mini";
-import { build } from "./pippin";
+import { build, running } from "./pippin";
 import { SCENARIOS } from "./scenarios";
 import { buildBase } from "./setup";
 
@@ -124,7 +123,7 @@ function stamp(): string {
 async function run(name: string): Promise<boolean> {
   const scenario = SCENARIOS[name];
   if (!scenario) throw new Error(`no scenario ${name}; the scenarios are ${Object.keys(SCENARIOS).join(", ")}`);
-  await prepare(MINI_LAN);
+  if (await running()) throw new Error("another pippin runs on this machine, and it holds the fixed UDP ports");
   const out = `${homedir()}/.cache/tasks/pippin-e2e/${stamp()}-${name}`;
   mkdirSync(out, { recursive: true });
   console.log(`${name}: ${scenario.about}\noutput: ${out}`);
