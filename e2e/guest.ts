@@ -66,9 +66,9 @@ export class Guest {
     await waitFor("admin at the console", timeoutMs, async (left) => (await this.ok(ready, left)) || undefined);
   }
 
-  /** The time of the guest, in the format of `log show --start`. */
-  async now(): Promise<string> {
-    return (await this.sh("date '+%Y-%m-%d %H:%M:%S'")).trim();
+  /** The time of the guest, in the format of `log show --start`. `timeoutMs` ends a call that hangs. */
+  async now(timeoutMs?: number): Promise<string> {
+    return (await this.sh("date '+%Y-%m-%d %H:%M:%S'", { timeoutMs })).trim();
   }
 
   /** The system log since `start`, of the processes named. */

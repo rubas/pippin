@@ -48,7 +48,7 @@ async function connected(
   macDisplay: boolean,
   body: (s: Session) => Promise<void>,
 ): Promise<void> {
-  const start = await waitFor("ssh to the VM", READY_MS, () => ctx.guest.now().catch(() => undefined));
+  const start = await waitFor("ssh to the VM", READY_MS, (left) => ctx.guest.now(left).catch(() => undefined));
   const waited = await waitBanner(ctx.guest.ip, READY_MS);
   ctx.check("screen sharing", true, `RFB banner after ${(waited / 1000).toFixed(1)} s`);
   const session = Session.start(ctx.guest.ip, ctx.login, ctx.out, macDisplay);

@@ -11,6 +11,7 @@ const BANNER_BYTES = 12;
 // One connection waits this long for the banner. Then a new one takes its
 // place, because a connection that the VM lost never gets one.
 const TRY_MS = 10_000;
+const PAUSE_MS = 1000;
 
 /** What one connection to the port got in its time. */
 export type Answer =
@@ -61,11 +62,23 @@ export function ask(host: string, port: number, timeoutMs: number): Promise<Answ
 }
 
 /**
+ * Calls `once` for one connection after the other until its answer serves,
+ * and returns the time that it took. Each call gets its time: what is left
+ * of `limitMs`, at most TRY_MS, and at least 1 s, like waitFor.
+ */
+export async function waitServes(once: (timeoutMs: number) => Promise<Answer>, limitMs: number): Promise<number> {
+  const begin = Date.now();
+  const waited = () => Date.now() - begin;
+  while (!serves(await once(Math.min(TRY_MS, Math.max(limitMs - waited(), 1000))), waited(), limitMs)) {
+    await Bun.sleep(PAUSE_MS);
+  }
+  return waited();
+}
+
+/**
  * Waits until Screen Sharing at `host` sends its RFB banner, and returns the
  * time that it took. Throws when it sends none within `limitMs`.
  */
-export async function waitBanner(host: string, limitMs: number): Promise<number> {
-  const begin = Date.now();
-  while (!serves(await ask(host, PORT, TRY_MS), Date.now() - begin, limitMs)) await Bun.sleep(1000);
-  return Date.now() - begin;
+export function waitBanner(host: string, limitMs: number): Promise<number> {
+  return waitServes((timeoutMs) => ask(host, PORT, timeoutMs), limitMs);
 }
