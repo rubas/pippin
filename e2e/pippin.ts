@@ -47,11 +47,13 @@ export class Session {
   ) {}
 
   /**
-   * Starts pippin against `ip`. It writes its log and stats to `out`. With
-   * `macDisplay`, pippin streams the Mac's own display (--no-virtual-display);
-   * else the Mac creates a virtual display of SIZE for it.
+   * Starts pippin against `ip` as `login`. It writes its log and stats to
+   * `out`. With `macDisplay`, pippin streams the Mac's own display
+   * (--no-virtual-display); else the Mac creates a virtual display of SIZE
+   * for it. `session` is the --session of pippin: `alt` opens a session of
+   * `login` next to the console.
    */
-  static async start(ip: string, login: Login, out: string, macDisplay = false): Promise<Session> {
+  static async start(ip: string, login: Login, out: string, macDisplay = false, session: "share" | "alt" = "share"): Promise<Session> {
     const name = `pippin-e2e-${process.pid}`;
     // The container sees only this directory of XDG_RUNTIME_DIR, which is
     // private, as pippin wants the directory of its FIFO.
@@ -65,8 +67,8 @@ export class Session {
     const fd = openSync(fifo, constants.O_RDWR | constants.O_NONBLOCK);
     const log = openSync(`${out}/pippin.log`, "a");
     const argv: [string, ...string[]] = [BINARY, "--headless", ip, "--user", login.username, "--password-stdin"];
-    argv.push("--session", "share", "-v", "--stats-json", `${out}/stats.jsonl`);
-    argv.push(...(macDisplay ? ["--no-virtual-display"] : ["--size", SIZE]));
+    argv.push("--session", session, "-v", "--stats-json", `${out}/stats.jsonl`);
+    argv.push(...(macDisplay ? ["--no-virtual-display"] : ["--size", process.env.E2E_SIZE ?? SIZE, "--scale", process.env.E2E_SCALE ?? "1"]));
     const { uid, gid } = userInfo();
     const docker = dockerRun(name, `${uid}:${gid}`, argv, [dir, out], { PIPPIN_CONTROL_FIFO: fifo });
     const child = Bun.spawn(docker, { stdin: "pipe", stdout: log, stderr: log });
