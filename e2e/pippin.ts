@@ -11,7 +11,7 @@ const TARGET = `${ROOT}/target`;
 const BINARY = `${TARGET}/release/pippin`;
 export const SIZE = "1920x1080";
 
-/** Builds pippin at the lowest priority with 8 jobs: asrock is Dominic's desktop. */
+/** Builds pippin at the lowest priority with 8 jobs, because the run shares a desktop with Dominic. */
 export async function build(log: string): Promise<void> {
   const out = await spawn(["nice", "-n", "19", "cargo", "build", "--release", "--locked", "--target-dir", TARGET], {
     cwd: ROOT,
