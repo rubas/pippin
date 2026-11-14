@@ -13,7 +13,7 @@ export const BUILD = "pippin-vm-new";
 /** The clone that `up` boots and `down` deletes. */
 export const RUN = "pippin-vm";
 
-// One launchd job of `agent`, the user of `ssh macmini`, runs `tart run` for
+// One launchd job of `agent`, the user of `ssh mac-mini`, runs `tart run` for
 // the VM of the moment. The job removes itself when the VM stops.
 const JOB = "dev.rubas.pippin-vm";
 const LOG = "~/Library/Logs/pippin-vm.log";
@@ -35,7 +35,7 @@ const PRELUDE = "set -eu\nPATH=/opt/homebrew/bin:$PATH\n";
 const inflight = new Set<Promise<string>>();
 
 function mini(script: string): Promise<string> {
-  const call = capture(["ssh", "-o", "ConnectTimeout=10", "macmini", "zsh", "-l"], { stdin: PRELUDE + script });
+  const call = capture(["ssh", "-o", "ConnectTimeout=10", "mac-mini", "zsh", "-l"], { stdin: PRELUDE + script });
   inflight.add(call);
   void call.catch(() => undefined).finally(() => inflight.delete(call));
   return call;
@@ -52,7 +52,7 @@ export async function cancel(owner: string): Promise<void> {
 }
 
 export function readFile(path: string): Promise<Uint8Array> {
-  return captureBytes(["ssh", "-o", "ConnectTimeout=10", "macmini", "cat", path]);
+  return captureBytes(["ssh", "-o", "ConnectTimeout=10", "mac-mini", "cat", path]);
 }
 
 // The guest has no compiler, so the mini builds the Swift tools of e2e/guest/.
